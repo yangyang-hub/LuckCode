@@ -1,0 +1,42 @@
+[project]
+name = "luckcode-project"
+language = "rust"
+
+[model]
+provider = "mock"
+model = "mock"
+
+[providers.mock]
+kind = "mock"
+model = "mock"
+
+[providers.openai]
+kind = "openai"
+model = "gpt-4.1"
+request_format = "chat-completions"
+api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+enabled = true
+
+[providers.responses]
+kind = "openai"
+model = "gpt-4.1"
+request_format = "responses"
+api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+enabled = true
+
+[providers.anthropic]
+kind = "anthropic"
+model = "claude-sonnet-4-5"
+api_key_env = "ANTHROPIC_API_KEY"
+base_url = "https://api.anthropic.com"
+enabled = true
+
+[commands]
+test = "cargo test"
+check = "cargo check"
+lint = "cargo clippy"
+
+[permission]
+mode = "manual"
