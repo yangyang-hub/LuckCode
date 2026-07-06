@@ -45,7 +45,7 @@ pub struct AgentToolCallRecord {
     pub ok: bool,
 }
 
-pub async fn run_readonly_agent(
+pub async fn run_agent(
     task: &str,
     workspace_root: &Path,
     session: &SessionInfo,
@@ -241,18 +241,18 @@ pub fn build_project_context(workspace_root: &Path, max_file_size: u64) -> Resul
         }
     }
 
-    if let Some(status) = git_status_short(workspace_root) {
-        if !status.trim().is_empty() {
-            out.push_str("- Git status:\n");
-            out.push_str(&indent_block(&status, "  "));
-        }
+    if let Some(status) = git_status_short(workspace_root)
+        && !status.trim().is_empty()
+    {
+        out.push_str("- Git status:\n");
+        out.push_str(&indent_block(&status, "  "));
     }
 
-    if let Some(diff_stat) = git_diff_stat(workspace_root) {
-        if !diff_stat.trim().is_empty() {
-            out.push_str("- Git diff stat:\n");
-            out.push_str(&indent_block(&diff_stat, "  "));
-        }
+    if let Some(diff_stat) = git_diff_stat(workspace_root)
+        && !diff_stat.trim().is_empty()
+    {
+        out.push_str("- Git diff stat:\n");
+        out.push_str(&indent_block(&diff_stat, "  "));
     }
 
     let mut preview_count = 0;
@@ -520,16 +520,15 @@ pub fn resolve_provider_config(
         .unwrap_or_else(|| provider_name.clone());
 
     let default_model = ModelConfig::default().model;
-    let model = if model_override.is_some() {
-        root_model
-    } else if root_model != default_model || provider_name == "mock" {
-        root_model
-    } else {
-        profile
-            .and_then(|profile| profile.model.clone())
-            .or_else(|| inferred.model.clone())
-            .unwrap_or(root_model)
-    };
+    let model =
+        if model_override.is_some() || root_model != default_model || provider_name == "mock" {
+            root_model
+        } else {
+            profile
+                .and_then(|profile| profile.model.clone())
+                .or_else(|| inferred.model.clone())
+                .unwrap_or(root_model)
+        };
 
     Ok(ResolvedProviderConfig {
         name: provider_name,
@@ -611,10 +610,11 @@ impl Default for PermissionConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
     Plan,
+    #[default]
     Manual,
     AcceptEdits,
     Auto,
@@ -632,12 +632,6 @@ impl PermissionMode {
             Self::Sandbox => "sandbox",
             Self::Dangerous => "dangerous",
         }
-    }
-}
-
-impl Default for PermissionMode {
-    fn default() -> Self {
-        Self::Manual
     }
 }
 
@@ -763,10 +757,10 @@ fn apply_env_overrides(config: &mut AppConfig) {
         config.model.model = value;
     }
 
-    if let Ok(value) = env::var("LUCKCODE_PERMISSION_MODE") {
-        if let Ok(mode) = parse_permission_mode(&value) {
-            config.permission.mode = mode;
-        }
+    if let Ok(value) = env::var("LUCKCODE_PERMISSION_MODE")
+        && let Ok(mode) = parse_permission_mode(&value)
+    {
+        config.permission.mode = mode;
     }
 }
 
@@ -812,10 +806,10 @@ impl PartialAppConfig {
             }
         }
 
-        if let Some(permission) = self.permission {
-            if let Some(mode) = permission.mode {
-                config.permission.mode = mode;
-            }
+        if let Some(permission) = self.permission
+            && let Some(mode) = permission.mode
+        {
+            config.permission.mode = mode;
         }
 
         if let Some(workspace) = self.workspace {

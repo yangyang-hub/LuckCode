@@ -635,10 +635,10 @@ fn parse_openai_chat_stream_event(
     let mut events = Vec::new();
 
     for choice in chunk.choices {
-        if let Some(content) = choice.delta.content {
-            if !content.is_empty() {
-                events.push(ModelEvent::TextDelta(content));
-            }
+        if let Some(content) = choice.delta.content
+            && !content.is_empty()
+        {
+            events.push(ModelEvent::TextDelta(content));
         }
 
         if let Some(tool_calls) = choice.delta.tool_calls {
@@ -672,10 +672,10 @@ fn parse_anthropic_stream_event(
             if let Some(block) = event.get("content_block") {
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     pending_tools.observe_start(index, block);
-                } else if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        events.push(ModelEvent::TextDelta(text.to_string()));
-                    }
+                } else if let Some(text) = block.get("text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    events.push(ModelEvent::TextDelta(text.to_string()));
                 }
             }
         }
@@ -684,10 +684,10 @@ fn parse_anthropic_stream_event(
             if let Some(delta) = event.get("delta") {
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
-                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                            if !text.is_empty() {
-                                events.push(ModelEvent::TextDelta(text.to_string()));
-                            }
+                        if let Some(text) = delta.get("text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            events.push(ModelEvent::TextDelta(text.to_string()));
                         }
                     }
                     Some("input_json_delta") => {
@@ -728,10 +728,10 @@ fn parse_openai_responses_stream_event(
 
     match event.get("type").and_then(Value::as_str) {
         Some("response.output_text.delta") => {
-            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                if !delta.is_empty() {
-                    events.push(ModelEvent::TextDelta(delta.to_string()));
-                }
+            if let Some(delta) = event.get("delta").and_then(Value::as_str)
+                && !delta.is_empty()
+            {
+                events.push(ModelEvent::TextDelta(delta.to_string()));
             }
         }
         Some("response.output_item.added") => {
@@ -995,10 +995,11 @@ impl PendingAnthropicToolCalls {
         if let Some(name) = block.get("name").and_then(Value::as_str) {
             pending.name = name.to_string();
         }
-        if let Some(input) = block.get("input") {
-            if input.is_object() && !input.as_object().is_some_and(|object| object.is_empty()) {
-                pending.arguments = input.to_string();
-            }
+        if let Some(input) = block.get("input")
+            && input.is_object()
+            && !input.as_object().is_some_and(|object| object.is_empty())
+        {
+            pending.arguments = input.to_string();
         }
     }
 
@@ -1180,7 +1181,7 @@ fn final_mock_summary(tool_context: &str) -> String {
         summary.push_str("- 项目已经包含 README、文档和 Agent 规则文件。\n");
     }
 
-    summary.push_str("- 目前 Agent Loop 已能执行只读工具并基于结果给出摘要；编辑和 shell 执行仍应放到后续权限系统阶段。\n");
+    summary.push_str("- Agent Loop 已支持只读工具并基于结果给出摘要；非 plan 模式下还可调用 edit_file / write_file，写文件前会展示 diff、按权限模式询问确认并创建 checkpoint（luckcode restore 可回滚）。shell 执行仍属于下一阶段。\n");
     summary
 }
 

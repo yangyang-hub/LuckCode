@@ -858,6 +858,8 @@ final answer
 
 ### 第 6 周：文件编辑系统
 
+> 状态：已实现（v0.2）。`edit_file`（精确字符串替换 + `replace_all`）、`write_file`（仅新建）、checkpoint（`create_checkpoint` / `restore_checkpoint` / `list_checkpoints`）、diff preview、按权限模式确认、`luckcode restore [CHECKPOINT_ID]`。`edit_file` 采用精确字符串替换而非 unified-diff 输入，对模型更稳健；diff 用 `similar` 渲染。
+
 目标：可以修改文件，但修改前必须确认。
 
 实现：
@@ -1133,6 +1135,8 @@ luckcode --plan "解释这个模块"
 ```
 
 ### v0.2：可编辑代码助手
+
+> 状态：已实现。
 
 能力：
 

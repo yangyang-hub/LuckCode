@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use futures_util::StreamExt;
 use luckcode_core::{
-    AgentOptions, AppConfig, InitFileAction, InitOptions, ResolvedProviderConfig, config_to_toml,
-    init_project, load_config, resolve_provider_config, run_readonly_agent,
+    AgentOptions, AppConfig, InitFileAction, InitOptions, PermissionMode, ResolvedProviderConfig,
+    config_to_toml, init_project, load_config, resolve_provider_config, run_agent,
 };
 use luckcode_model::{
     AnthropicProvider, Message, MessageRole, MockProvider, ModelEvent, ModelProvider, ModelRequest,
@@ -11,13 +11,19 @@ use luckcode_model::{
     is_openai_compatible_provider,
 };
 use luckcode_storage::{
-    ProjectInfo, SessionInfo, append_session_message, create_session_jsonl, sessions_root,
+    ProjectInfo, SessionInfo, append_session_checkpoint, append_session_message, create_checkpoint,
+    create_session_jsonl, latest_checkpoint, restore_checkpoint, sessions_root,
 };
-use luckcode_tools::{ToolCall, ToolContext, readonly_registry};
+use luckcode_tools::{
+    CreateCheckpoint, EditApproval, EditPreview, ToolCall, ToolContext, full_registry,
+    readonly_registry,
+};
 use std::{
     env, fs,
     io::{self, Write},
+    path::PathBuf,
     process::Command,
+    sync::Arc,
 };
 use tracing::Level;
 
@@ -89,6 +95,10 @@ enum Commands {
         #[command(subcommand)]
         command: Option<SessionCommand>,
     },
+    Restore {
+        #[arg(value_name = "CHECKPOINT_ID")]
+        checkpoint_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -153,6 +163,7 @@ async fn run() -> Result<()> {
         Some(Commands::Ask { prompt }) => handle_ask(cli.provider, cli.model, prompt).await,
         Some(Commands::Providers { command }) => handle_providers(command),
         Some(Commands::Session { command }) => handle_session(command),
+        Some(Commands::Restore { checkpoint_id }) => handle_restore(checkpoint_id),
         None if !cli.prompt.is_empty() => {
             run_prompt(
                 cli.prompt,
@@ -223,7 +234,7 @@ fn handle_config(command: ConfigCommand) -> Result<()> {
 async fn handle_tools(command: ToolsCommand) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let loaded = load_config(&cwd)?;
-    let registry = readonly_registry();
+    let registry = full_registry();
 
     match command {
         ToolsCommand::List => {
@@ -235,12 +246,11 @@ async fn handle_tools(command: ToolsCommand) -> Result<()> {
         ToolsCommand::Call { name, input } => {
             let arguments =
                 serde_json::from_str(&input).context("tool input must be valid JSON")?;
-            let output = registry
-                .execute(
-                    ToolCall { name, arguments },
-                    ToolContext::new(cwd, loaded.config.workspace.max_file_size),
-                )
-                .await?;
+            // Editing tools prompt via stdin; readonly tools ignore the approval policy.
+            let ctx = ToolContext::new(cwd, loaded.config.workspace.max_file_size)
+                .with_edit_approval(EditApproval::Prompt)
+                .with_confirm_edit(Arc::new(confirm_edit_stdin));
+            let output = registry.execute(ToolCall { name, arguments }, ctx).await?;
 
             println!("{}", output.content);
             if output.truncated {
@@ -275,12 +285,11 @@ async fn run_prompt(
     let session = SessionInfo::new(&project);
     let session_path = create_session_jsonl(&session, &prompt)?;
 
-    let mode = if plan {
-        "plan"
-    } else if accept_edits {
-        "accept-edits"
+    let (mode, approval) = resolve_approval(plan, accept_edits, loaded.config.permission.mode);
+    let registry = if approval == EditApproval::Refuse {
+        readonly_registry()
     } else {
-        loaded.config.permission.mode.as_str()
+        full_registry()
     };
 
     println!("mode: {mode}");
@@ -290,14 +299,19 @@ async fn run_prompt(
     println!("model: {}/{}", resolved.name, resolved.model);
     println!();
 
-    let registry = readonly_registry();
-    let result = run_readonly_agent(
+    let tool_context = build_tool_context(
+        cwd.clone(),
+        loaded.config.workspace.max_file_size,
+        approval,
+        &session,
+    );
+    let result = run_agent(
         &prompt,
         &cwd,
         &session,
         provider.as_ref(),
         &registry,
-        ToolContext::new(cwd.clone(), loaded.config.workspace.max_file_size),
+        tool_context,
         AgentOptions {
             max_steps: 8,
             stream: loaded.config.ui.stream,
@@ -323,6 +337,64 @@ async fn run_prompt(
     }
 
     Ok(())
+}
+
+/// Resolve the displayed mode label and the [`EditApproval`] policy from CLI flags + config.
+fn resolve_approval(
+    plan: bool,
+    accept_edits: bool,
+    configured: PermissionMode,
+) -> (&'static str, EditApproval) {
+    if plan {
+        return ("plan", EditApproval::Refuse);
+    }
+    if accept_edits {
+        return ("accept-edits", EditApproval::Auto);
+    }
+    match configured {
+        PermissionMode::Plan => ("plan", EditApproval::Refuse),
+        PermissionMode::Manual => ("manual", EditApproval::Prompt),
+        PermissionMode::AcceptEdits => ("accept-edits", EditApproval::Auto),
+        PermissionMode::Auto => ("auto", EditApproval::Auto),
+        PermissionMode::Dangerous => ("dangerous", EditApproval::Auto),
+        PermissionMode::Sandbox => ("sandbox", EditApproval::Refuse),
+    }
+}
+
+fn build_tool_context(
+    cwd: PathBuf,
+    max_file_size: u64,
+    approval: EditApproval,
+    session: &SessionInfo,
+) -> ToolContext {
+    let mut ctx = ToolContext::new(cwd, max_file_size).with_edit_approval(approval);
+    if approval != EditApproval::Refuse {
+        let session_for_checkpoint = session.clone();
+        let create_checkpoint: CreateCheckpoint = Arc::new(move |files: &[PathBuf]| {
+            let id = create_checkpoint(&session_for_checkpoint, files)?;
+            append_session_checkpoint(&session_for_checkpoint, &id)?;
+            Ok(id)
+        });
+        ctx = ctx
+            .with_create_checkpoint(create_checkpoint)
+            .with_confirm_edit(Arc::new(confirm_edit_stdin));
+    }
+    ctx
+}
+
+/// Print an edit preview and ask the user whether to apply it.
+fn confirm_edit_stdin(preview: &EditPreview) -> bool {
+    println!("\n--- proposed edit: {} ---", preview.path.display());
+    print!("{}", preview.diff);
+    println!(
+        "--- {} addition(s), {} deletion(s) ---",
+        preview.additions, preview.deletions
+    );
+    print!("apply this change? (y/N): ");
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 async fn handle_ask(
@@ -529,6 +601,67 @@ fn handle_session(command: Option<SessionCommand>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn handle_restore(checkpoint_id: Option<String>) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let project = ProjectInfo::discover(&cwd)?;
+
+    let Some(session_id) = latest_session_id(&project.hash)? else {
+        println!("No sessions found for this project; nothing to restore.");
+        return Ok(());
+    };
+
+    let checkpoint_id = match checkpoint_id {
+        Some(id) => id,
+        None => match latest_checkpoint(&project.hash, &session_id)? {
+            Some(latest) => latest.id,
+            None => {
+                println!("No checkpoints found for session {session_id}; nothing to restore.");
+                return Ok(());
+            }
+        },
+    };
+
+    let restored = restore_checkpoint(&project.root, &project.hash, &session_id, &checkpoint_id)
+        .with_context(|| format!("failed to restore checkpoint {checkpoint_id}"))?;
+
+    println!("restored checkpoint: {checkpoint_id}");
+    println!("session: {session_id}");
+    for path in restored {
+        println!("- {path}");
+    }
+
+    Ok(())
+}
+
+/// Newest session id for a project, based on JSONL file mtime.
+fn latest_session_id(project_hash: &str) -> Result<Option<String>> {
+    let dir = sessions_root()?.join(project_hash);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(None);
+    };
+
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        let id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(ToOwned::to_owned);
+        if let Some(id) = id
+            && newest.as_ref().is_none_or(|(prev, _)| modified > *prev)
+        {
+            newest = Some((modified, id));
+        }
+    }
+
+    Ok(newest.map(|(_, id)| id))
 }
 
 fn print_git_diff() -> Result<()> {

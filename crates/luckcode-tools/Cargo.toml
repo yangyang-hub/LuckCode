@@ -10,3 +10,8 @@ async-trait.workspace = true
 ignore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
