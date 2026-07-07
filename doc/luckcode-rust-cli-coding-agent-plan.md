@@ -1155,12 +1155,14 @@ luckcode restore
 
 ### v0.3：可验证 Coding Agent
 
+> 状态：第一版已实现 `run_shell`、命令权限策略、危险命令拦截、超时和输出截断；测试失败后的自动重试策略仍需继续细化。
+
 能力：
 
-- `run_shell`
-- 权限系统
-- 测试验证
-- 失败重试
+- `run_shell`（已实现）
+- 第一版权限系统（`CommandPolicy` / `PermissionEngine`、已实现）
+- 测试验证（可通过 `run_shell` 执行配置的测试命令）
+- 失败重试（Agent Loop 可基于 tool result 继续迭代，后续补更明确策略）
 
 命令：
 
@@ -1170,12 +1172,14 @@ luckcode "修复测试失败，并运行测试验证"
 
 ### v0.4：会话恢复
 
+> 状态：第一版已实现。`--resume` 可查看或继续当前项目 session，`--compact` 会生成 deterministic compact summary 并写回 JSONL，`memory show/set/remove` 提供项目记忆。
+
 能力：
 
-- session JSONL
-- resume
-- compact
-- project memory
+- session JSONL（已实现）
+- resume（已实现）
+- compact（已实现）
+- project memory（已实现）
 
 命令：
 
@@ -1186,11 +1190,13 @@ luckcode --compact
 
 ### v0.5：代码智能
 
+> 状态：基础版已实现。当前提供 parser-free symbol index（`luckcode symbols` / `list_symbols`），覆盖常见 Rust/TS/JS/Python/Go/Java 函数和类型定义；tree-sitter 精准解析仍是后续增强。
+
 能力：
 
-- tree-sitter
-- symbol index
-- function-level context
+- tree-sitter（后续增强）
+- symbol index（基础版已实现）
+- function-level context（后续增强）
 
 命令：
 
@@ -1201,28 +1207,34 @@ luckcode "解释这个函数的调用链"
 
 ### v0.6：MCP
 
+> 状态：配置检查基础版已实现。当前支持 `luckcode mcp list/show` 读取 `.luckcode/mcp.json` 并隐藏 env 值；stdio tool discovery / tool call 仍需继续实现。
+
 能力：
 
-- MCP client
-- MCP tool registry
-- MCP permission
+- MCP client（配置检查基础版已实现）
+- MCP tool registry（后续）
+- MCP permission（后续）
 
 ### v0.7：Sandbox
 
+> 状态：权限策略 baseline 已实现。`--sandbox` 禁用文件编辑，shell 命令仍需确认并经过硬拒绝策略；Docker / container 隔离仍需后续实现。
+
 能力：
 
-- Docker executor
-- readonly mode
-- network policy
+- Docker executor（后续）
+- readonly mode（权限策略 baseline 已实现）
+- network policy（后续）
 
 ### v0.8：TUI
 
+> 状态：命令行 session browser baseline 已实现。`luckcode session list/show` 可查看 session 和事件 timeline；ratatui 交互式界面仍需后续实现。
+
 能力：
 
-- `ratatui`
-- interactive diff
-- tool call timeline
-- session browser
+- `ratatui`（后续）
+- interactive diff（后续）
+- tool call timeline（命令行 baseline 已实现）
+- session browser（命令行 baseline 已实现）
 
 ### v1.0：稳定版
 

@@ -218,7 +218,7 @@ pub trait Tool: Send + Sync {
 
 ### 7.2 注册与只读/可写分离
 
-- 只读工具注册到 `readonly_registry()`，写文件工具注册到 `mutating_registry()`；`full_registry()` 是两者合集。**只读工具和可写工具必须分集合注册**，`--plan` 模式只挂 `readonly_registry()`，其它模式挂 `full_registry()`。
+- 只读工具注册到 `readonly_registry()`，写文件 / shell 执行工具注册到 `mutating_registry()`；`full_registry()` 是两者合集。**只读工具和可写 / 执行工具必须分集合注册**，`--plan` 模式只挂 `readonly_registry()`，其它允许修改或执行的模式挂 `full_registry()`。
 - `ToolRegistry::list()` 已按名字排序，新增工具无需手动排。
 
 ### 7.3 路径安全（强制）
@@ -292,8 +292,9 @@ pub trait Tool: Send + Sync {
 - 用户目录遵循 XDG：配置 `XDG_CONFIG_HOME/luckcode`（回退 `~/.config/luckcode`），数据 `XDG_DATA_HOME/luckcode`（回退 `~/.local/share/luckcode`）。统一通过 `config_dir()` / `data_dir()` 获取，**禁止在业务代码里硬编码 `~/.config/...`**。
 - 项目标识用 `project_hash`（路径 SHA256 前 8 字节 hex），session id 用 `ses_<uuid_v4_simple>`。所有按项目聚合的存储（session、checkpoint、memory）都以 `project_hash` 分目录。
 - session 采用 **JSONL 追加写**：`create_session_jsonl`（`create_new`，不覆盖）+ `append_session_*` 系列。**只追加、不覆盖、不就地改写历史行**——这是恢复和审计的基础。
-- 新增 session 事件类型时，走 `append_session_event(session, json!({ "type": "...", ... }))`，`created_at` 由该函数统一注入，不要在各调用点重复写时间戳。checkpoint 事件用专门的 `append_session_checkpoint(session, id)`。
+- 新增 session 事件类型时，走 `append_session_event(session, json!({ "type": "...", ... }))`，`created_at` 由该函数统一注入，不要在各调用点重复写时间戳。checkpoint 事件用专门的 `append_session_checkpoint(session, id)`；compact summary 事件用 `append_session_compact_summary(session, summary)`。
 - checkpoint 存储落在 `data_dir/checkpoints/<project_hash>/<session_id>/<checkpoint_id>/`（`manifest.json` + `files/<sanitized>.before`）。新增/读取/回滚只走 `create_checkpoint` / `list_checkpoints` / `latest_checkpoint` / `restore_checkpoint`，**不要在业务代码里手写 checkpoint 目录结构**。`<sanitized>` 把路径分隔符替换为 `_`（如 `src/main.rs` → `src_main.rs.before`，与计划 §9 一致）。
+- project memory 存储落在 `data_dir/memory/<project_hash>.json`，只通过 `read_project_memory` / `set_project_memory` / `remove_project_memory` 访问；Agent context 可以读取 memory，但不得把它当成高于 `AGENTS.md` / system prompt 的规则。
 - 路径展示一律用 `Path::display()`；构造错误上下文必须包含相关路径。
 
 ---
@@ -302,9 +303,10 @@ pub trait Tool: Send + Sync {
 
 这是 LuckCode 的红线，代码层面强制：
 
-- **只读 vs 可写工具严格分离**：只读工具（list/read/search/detect/git_status/git_diff）可自动执行；可写/执行类（`edit_file`、`write_file`、`run_shell`、`delete_file`、MCP 工具）必须经过权限系统。
-- **默认拒绝清单**（计划 §8）：`sudo`、`rm -rf`、`chmod -R 777`、`curl ... | sh`、`wget ... | bash`、`dd`、`mkfs`、`docker system prune`、`terraform destroy`、`kubectl delete` 等。命中即 `Deny`，不询问。
-- 第一版里除 `git status` / `git diff` 外的 shell 命令，**默认先询问用户**。
+- **只读 vs 可写工具严格分离**：只读工具（list/read/search/detect/git_status/git_diff/list_symbols）可自动执行；可写/执行类（`edit_file`、`write_file`、`run_shell`、`delete_file`、MCP 工具）必须经过权限系统。
+- **默认拒绝清单**（计划 §8）：`sudo`、`rm -rf`、`chmod -R 777`、`curl ... | sh`、`wget ... | bash`、`dd`、`mkfs`、`docker system prune`、`terraform apply`、`terraform destroy`、`kubectl delete`、引用 `.env` / 私钥 / 凭据路径的命令等。命中即 `Deny`，不询问。
+- 第一版里除 `git status` / `git diff` 外的 shell 命令，**默认先询问用户**；`auto` / `dangerous` 模式下仍必须在执行前展示命令，且硬拒绝清单始终生效。
+- `run_shell` 必须固定在 workspace root 下执行，使用 `tokio::process::Command`，提供超时控制和 stdout/stderr 截断；非零退出码作为 tool result 返回给 Agent，不当作工具崩溃。
 - 文件编辑流程已落地：`read_file` → 精确字符串替换 → 本地校验 → 展示 diff → 按 `EditApproval` 确认 → 建 checkpoint → apply（计划 §9）。**不允许模型输出直接覆盖整个文件**。审批不通过独立的 PermissionEngine（那是第 7 周），而是由 CLI 把 `PermissionMode` 映射成 `EditApproval` 注入 `ToolContext`，编辑工具内部据此 Refuse/Prompt/Auto。
 - 路径越界检查、敏感文件跳过、文件大小上限见 §7.3。
 - 不读取 `.env`、私钥、凭据（`AGENTS.md`）；不在日志/错误/session 中回传这些文件内容。

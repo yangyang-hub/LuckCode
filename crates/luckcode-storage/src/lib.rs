@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -43,6 +44,15 @@ impl SessionInfo {
     pub fn new(project: &ProjectInfo) -> Self {
         Self {
             id: new_session_id(),
+            project_hash: project.hash.clone(),
+            project_path: project.root.clone(),
+            created_at: Utc::now(),
+        }
+    }
+
+    pub fn existing(project: &ProjectInfo, id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
             project_hash: project.hash.clone(),
             project_path: project.root.clone(),
             created_at: Utc::now(),
@@ -98,6 +108,14 @@ pub fn session_jsonl_path(project_hash: &str, session_id: &str) -> Result<PathBu
 
 pub fn checkpoints_root() -> Result<PathBuf> {
     Ok(data_dir()?.join("checkpoints"))
+}
+
+pub fn memory_root() -> Result<PathBuf> {
+    Ok(data_dir()?.join("memory"))
+}
+
+pub fn project_memory_path(project_hash: &str) -> Result<PathBuf> {
+    Ok(memory_root()?.join(format!("{project_hash}.json")))
 }
 
 pub fn checkpoint_dir(
@@ -363,6 +381,16 @@ pub fn append_session_checkpoint(session: &SessionInfo, checkpoint_id: &str) -> 
     )
 }
 
+pub fn append_session_compact_summary(session: &SessionInfo, summary: &str) -> Result<()> {
+    append_session_event(
+        session,
+        json!({
+            "type": "compact_summary",
+            "content": summary,
+        }),
+    )
+}
+
 pub fn append_session_event(session: &SessionInfo, mut event: Value) -> Result<()> {
     let path = session_jsonl_path(&session.project_hash, &session.id)?;
     let mut file = OpenOptions::new()
@@ -378,6 +406,63 @@ pub fn append_session_event(session: &SessionInfo, mut event: Value) -> Result<(
         .with_context(|| format!("failed to append session file {}", path.display()))?;
 
     Ok(())
+}
+
+pub fn read_session_events(project_hash: &str, session_id: &str) -> Result<Vec<Value>> {
+    let path = session_jsonl_path(project_hash, session_id)?;
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read session file {}", path.display()))?;
+    let mut events = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str(line)
+            .with_context(|| format!("failed to parse {} line {}", path.display(), idx + 1))?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+pub fn session_exists(project_hash: &str, session_id: &str) -> Result<bool> {
+    Ok(session_jsonl_path(project_hash, session_id)?.is_file())
+}
+
+pub fn read_project_memory(project_hash: &str) -> Result<BTreeMap<String, String>> {
+    let path = project_memory_path(project_hash)?;
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read project memory {}", path.display()))?;
+    let memory = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse project memory {}", path.display()))?;
+    Ok(memory)
+}
+
+pub fn write_project_memory(project_hash: &str, memory: &BTreeMap<String, String>) -> Result<()> {
+    let path = project_memory_path(project_hash)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create memory directory {}", parent.display()))?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(memory)?)
+        .with_context(|| format!("failed to write project memory {}", path.display()))?;
+    Ok(())
+}
+
+pub fn set_project_memory(project_hash: &str, key: &str, value: &str) -> Result<()> {
+    let mut memory = read_project_memory(project_hash)?;
+    memory.insert(key.to_string(), value.to_string());
+    write_project_memory(project_hash, &memory)
+}
+
+pub fn remove_project_memory(project_hash: &str, key: &str) -> Result<bool> {
+    let mut memory = read_project_memory(project_hash)?;
+    let removed = memory.remove(key).is_some();
+    write_project_memory(project_hash, &memory)?;
+    Ok(removed)
 }
 
 #[derive(Debug, Serialize)]
@@ -464,5 +549,47 @@ mod tests {
             .unwrap();
         assert_eq!(latest.id, second);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn session_events_roundtrip_jsonl() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let project = ProjectInfo {
+            root: root.clone(),
+            hash: project_hash(&root),
+        };
+        let session = SessionInfo::new(&project);
+
+        create_session_jsonl(&session, "initial task").expect("create session");
+        append_session_message(&session, "assistant", "done").expect("append assistant");
+        append_session_compact_summary(&session, "summary").expect("append compact summary");
+
+        let events = read_session_events(&project.hash, &session.id).expect("read events");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["type"], "user");
+        assert_eq!(events[0]["content"], "initial task");
+        assert_eq!(events[1]["type"], "assistant");
+        assert_eq!(events[2]["type"], "compact_summary");
+        assert!(session_exists(&project.hash, &session.id).unwrap());
+    }
+
+    #[test]
+    fn project_memory_persists_key_values() {
+        let project_hash = format!("test_{}", Uuid::new_v4().simple());
+        let memory_path = project_memory_path(&project_hash).expect("memory path");
+
+        set_project_memory(&project_hash, "project.test_command", "cargo test")
+            .expect("set memory");
+        let memory = read_project_memory(&project_hash).expect("read memory");
+        assert_eq!(
+            memory.get("project.test_command").map(String::as_str),
+            Some("cargo test")
+        );
+
+        assert!(remove_project_memory(&project_hash, "project.test_command").unwrap());
+        let memory = read_project_memory(&project_hash).expect("read memory after delete");
+        assert!(!memory.contains_key("project.test_command"));
+        let _ = fs::remove_file(memory_path);
     }
 }

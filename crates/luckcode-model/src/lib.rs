@@ -1181,7 +1181,7 @@ fn final_mock_summary(tool_context: &str) -> String {
         summary.push_str("- 项目已经包含 README、文档和 Agent 规则文件。\n");
     }
 
-    summary.push_str("- Agent Loop 已支持只读工具并基于结果给出摘要；非 plan 模式下还可调用 edit_file / write_file，写文件前会展示 diff、按权限模式询问确认并创建 checkpoint（luckcode restore 可回滚）。shell 执行仍属于下一阶段。\n");
+    summary.push_str("- Agent Loop 已支持只读工具、edit_file / write_file 和 run_shell；文件修改会展示 diff、按权限模式确认并创建 checkpoint（luckcode restore 可回滚），shell 命令会经过硬拒绝策略、确认或展示后再执行。\n");
     summary
 }
 

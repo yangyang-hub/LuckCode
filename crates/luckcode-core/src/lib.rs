@@ -5,7 +5,8 @@ use luckcode_model::{
     ToolSchema,
 };
 use luckcode_storage::{
-    SessionInfo, append_session_message, append_session_tool_call, append_session_tool_result,
+    SessionInfo, append_session_compact_summary, append_session_message, append_session_tool_call,
+    append_session_tool_result, project_hash, read_project_memory, read_session_events,
 };
 use luckcode_tools::{ToolCall as LocalToolCall, ToolContext, ToolRegistry};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use std::{
 pub struct AgentOptions {
     pub max_steps: usize,
     pub stream: bool,
+    pub resume_summary: Option<String>,
 }
 
 impl Default for AgentOptions {
@@ -27,6 +29,7 @@ impl Default for AgentOptions {
         Self {
             max_steps: 8,
             stream: true,
+            resume_summary: None,
         }
     }
 }
@@ -54,7 +57,12 @@ pub async fn run_agent(
     tool_context: ToolContext,
     options: AgentOptions,
 ) -> Result<AgentResult> {
-    let mut messages = initial_messages(task, workspace_root, tool_context.max_file_size)?;
+    let mut messages = initial_messages(
+        task,
+        workspace_root,
+        tool_context.max_file_size,
+        options.resume_summary.as_deref(),
+    )?;
     let tool_schemas = tool_schemas(tools);
     let mut final_answer = String::new();
     let mut tool_records = Vec::new();
@@ -185,10 +193,16 @@ async fn execute_tool_call(
     }
 }
 
-fn initial_messages(task: &str, workspace_root: &Path, max_file_size: u64) -> Result<Vec<Message>> {
+fn initial_messages(
+    task: &str,
+    workspace_root: &Path,
+    max_file_size: u64,
+    resume_summary: Option<&str>,
+) -> Result<Vec<Message>> {
     let mut system = String::from(
         "You are LuckCode, a local Rust CLI coding agent. \
-         In this phase you may only use readonly tools. \
+         You may use readonly tools, file editing tools, and run_shell when permissions allow. \
+         Shell commands must be shown before execution and dangerous commands are refused. \
          Do not claim that files were modified or commands were executed unless a tool result proves it.",
     );
 
@@ -204,6 +218,16 @@ fn initial_messages(task: &str, workspace_root: &Path, max_file_size: u64) -> Re
     if !project_context.trim().is_empty() {
         system.push_str("\n\nProject context:\n");
         system.push_str(&project_context);
+    }
+
+    if let Some(summary) = resume_summary
+        && !summary.trim().is_empty()
+    {
+        system.push_str("\n\nResumed session summary:\n");
+        system.push_str(summary);
+        if !system.ends_with('\n') {
+            system.push('\n');
+        }
     }
 
     Ok(vec![
@@ -255,6 +279,18 @@ pub fn build_project_context(workspace_root: &Path, max_file_size: u64) -> Resul
         out.push_str(&indent_block(&diff_stat, "  "));
     }
 
+    let memory = read_project_memory_for_root(workspace_root)?;
+    if !memory.is_empty() {
+        out.push_str("- Project memory:\n");
+        for (key, value) in memory {
+            out.push_str("  - ");
+            out.push_str(&key);
+            out.push_str(": ");
+            out.push_str(&value);
+            out.push('\n');
+        }
+    }
+
     let mut preview_count = 0;
     for path in important_files {
         if preview_count >= 4 {
@@ -278,6 +314,215 @@ pub fn build_project_context(workspace_root: &Path, max_file_size: u64) -> Resul
     }
 
     Ok(out)
+}
+
+pub fn compact_session(session: &SessionInfo) -> Result<CompactSessionResult> {
+    let events = read_session_events(&session.project_hash, &session.id)?;
+    let summary = build_compact_summary(&events);
+    append_session_compact_summary(session, &summary)?;
+    Ok(CompactSessionResult {
+        session_id: session.id.clone(),
+        event_count: events.len(),
+        summary,
+    })
+}
+
+pub fn compact_summary_for_session(project_hash: &str, session_id: &str) -> Result<String> {
+    let events = read_session_events(project_hash, session_id)?;
+    if let Some(summary) = latest_compact_summary_from_events(&events) {
+        return Ok(summary);
+    }
+    Ok(build_compact_summary(&events))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactSessionResult {
+    pub session_id: String,
+    pub event_count: usize,
+    pub summary: String,
+}
+
+fn build_compact_summary(events: &[serde_json::Value]) -> String {
+    let mut task_goal = String::new();
+    let mut completed = Vec::new();
+    let mut viewed_files = Vec::new();
+    let mut modified_files = Vec::new();
+    let mut commands = Vec::new();
+    let mut risks = Vec::new();
+    let mut latest_status = String::new();
+
+    for event in events {
+        let kind = event.get("type").and_then(serde_json::Value::as_str);
+        match kind {
+            Some("user") if task_goal.is_empty() => {
+                task_goal = compact_line(value_string(event, "content"), 240);
+            }
+            Some("assistant") => {
+                let line = compact_line(value_string(event, "content"), 220);
+                if !line.is_empty() {
+                    latest_status = line.clone();
+                    completed.push(line);
+                }
+            }
+            Some("tool_call") => {
+                let name = value_string(event, "name");
+                let args = event.get("args").unwrap_or(&serde_json::Value::Null);
+                match name.as_str() {
+                    "read_file" => push_unique(&mut viewed_files, arg_string(args, "path")),
+                    "edit_file" | "write_file" => {
+                        push_unique(&mut modified_files, arg_string(args, "path"));
+                    }
+                    "run_shell" => push_unique(&mut commands, arg_string(args, "command")),
+                    _ => {}
+                }
+            }
+            Some("tool_result") => {
+                if event
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let name = value_string(event, "name");
+                    risks.push(format!("{name} output was truncated"));
+                }
+                if event
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("error"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let name = value_string(event, "name");
+                    risks.push(format!("{name} returned an error"));
+                }
+            }
+            Some("checkpoint") => {
+                let id = value_string(event, "id");
+                if !id.is_empty() {
+                    latest_status = format!("latest checkpoint: {id}");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut summary = String::new();
+    push_section(
+        &mut summary,
+        "任务目标",
+        if task_goal.is_empty() {
+            "unknown"
+        } else {
+            task_goal.as_str()
+        },
+    );
+    push_list_section(
+        &mut summary,
+        "已完成",
+        &completed,
+        6,
+        "No assistant summary yet.",
+    );
+    push_list_section(
+        &mut summary,
+        "已查看文件",
+        &viewed_files,
+        20,
+        "None recorded.",
+    );
+    push_list_section(
+        &mut summary,
+        "已修改文件",
+        &modified_files,
+        20,
+        "None recorded.",
+    );
+    push_list_section(&mut summary, "已运行命令", &commands, 20, "None recorded.");
+    push_section(
+        &mut summary,
+        "当前状态",
+        if latest_status.is_empty() {
+            "No final status recorded."
+        } else {
+            latest_status.as_str()
+        },
+    );
+    push_section(
+        &mut summary,
+        "下一步建议",
+        "Resume with the next concrete request; inspect recent tool results before editing further.",
+    );
+    push_list_section(&mut summary, "风险点", &risks, 10, "No risks recorded.");
+    summary
+}
+
+fn latest_compact_summary_from_events(events: &[serde_json::Value]) -> Option<String> {
+    let event = events.last()?;
+    (event.get("type").and_then(serde_json::Value::as_str) == Some("compact_summary"))
+        .then(|| value_string(event, "content"))
+        .filter(|content| !content.trim().is_empty())
+}
+
+fn read_project_memory_for_root(workspace_root: &Path) -> Result<BTreeMap<String, String>> {
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    read_project_memory(&project_hash(root))
+}
+
+fn value_string(event: &serde_json::Value, key: &str) -> String {
+    event
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn arg_string(args: &serde_json::Value, key: &str) -> String {
+    args.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn compact_line(text: String, max_chars: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn push_unique(items: &mut Vec<String>, value: String) {
+    if value.is_empty() || items.iter().any(|item| item == &value) {
+        return;
+    }
+    items.push(value);
+}
+
+fn push_section(out: &mut String, title: &str, value: &str) {
+    out.push_str(title);
+    out.push_str(":\n");
+    out.push_str(value);
+    out.push_str("\n\n");
+}
+
+fn push_list_section(out: &mut String, title: &str, values: &[String], limit: usize, empty: &str) {
+    out.push_str(title);
+    out.push_str(":\n");
+    if values.is_empty() {
+        out.push_str("- ");
+        out.push_str(empty);
+        out.push('\n');
+    } else {
+        for value in values.iter().rev().take(limit).rev() {
+            out.push_str("- ");
+            out.push_str(value);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
 }
 
 fn detect_project_types(root: &Path) -> Vec<String> {
@@ -692,6 +937,30 @@ pub struct LoadedConfig {
     pub sources: Vec<ConfigSource>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct McpConfig {
+    #[serde(rename = "mcpServers")]
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub url: Option<String>,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedMcpConfig {
+    pub path: PathBuf,
+    pub loaded: bool,
+    pub config: McpConfig,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigSource {
     pub path: PathBuf,
@@ -714,6 +983,27 @@ pub fn load_config(workspace_root: impl AsRef<Path>) -> Result<LoadedConfig> {
     apply_env_overrides(&mut config);
 
     Ok(LoadedConfig { config, sources })
+}
+
+pub fn load_mcp_config(workspace_root: impl AsRef<Path>) -> Result<LoadedMcpConfig> {
+    let path = workspace_root.as_ref().join(".luckcode").join("mcp.json");
+    if !path.exists() {
+        return Ok(LoadedMcpConfig {
+            path,
+            loaded: false,
+            config: McpConfig::default(),
+        });
+    }
+
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read MCP config {}", path.display()))?;
+    let config = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse MCP config {}", path.display()))?;
+    Ok(LoadedMcpConfig {
+        path,
+        loaded: true,
+        config,
+    })
 }
 
 pub fn config_to_toml(config: &AppConfig) -> Result<String> {
@@ -1118,5 +1408,67 @@ mod tests {
         assert_eq!(resolved.name, "anthropic");
         assert_eq!(resolved.kind, "anthropic");
         assert_eq!(resolved.model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn compact_summary_extracts_session_activity() {
+        let events = vec![
+            serde_json::json!({ "type": "user", "content": "fix tests" }),
+            serde_json::json!({ "type": "assistant", "content": "I will inspect files." }),
+            serde_json::json!({
+                "type": "tool_call",
+                "name": "read_file",
+                "args": { "path": "Cargo.toml" }
+            }),
+            serde_json::json!({
+                "type": "tool_call",
+                "name": "edit_file",
+                "args": { "path": "src/lib.rs" }
+            }),
+            serde_json::json!({
+                "type": "tool_call",
+                "name": "run_shell",
+                "args": { "command": "cargo test" }
+            }),
+            serde_json::json!({
+                "type": "tool_result",
+                "name": "run_shell",
+                "metadata": { "error": true },
+                "truncated": true
+            }),
+        ];
+
+        let summary = build_compact_summary(&events);
+
+        assert!(summary.contains("任务目标:\nfix tests"));
+        assert!(summary.contains("- Cargo.toml"));
+        assert!(summary.contains("- src/lib.rs"));
+        assert!(summary.contains("- cargo test"));
+        assert!(summary.contains("run_shell output was truncated"));
+        assert!(summary.contains("run_shell returned an error"));
+    }
+
+    #[test]
+    fn mcp_config_parses_servers_without_exposing_env_semantics() {
+        let config: McpConfig = serde_json::from_str(
+            r#"{
+              "mcpServers": {
+                "local": {
+                  "command": "node",
+                  "args": ["server.js"],
+                  "env": { "API_KEY": "secret" }
+                }
+              }
+            }"#,
+        )
+        .expect("parse mcp config");
+
+        let server = config.servers.get("local").expect("server exists");
+        assert_eq!(server.command.as_deref(), Some("node"));
+        assert_eq!(server.args, vec!["server.js"]);
+        assert_eq!(
+            server.env.get("API_KEY").map(String::as_str),
+            Some("secret")
+        );
     }
 }
