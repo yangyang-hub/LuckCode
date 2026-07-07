@@ -3,13 +3,13 @@ use clap::{CommandFactory, Parser, Subcommand};
 use futures_util::StreamExt;
 use luckcode_core::{
     AgentOptions, AppConfig, InitFileAction, InitOptions, PermissionMode, ResolvedProviderConfig,
-    compact_session, compact_summary_for_session, config_to_toml, init_project, load_config,
-    load_mcp_config, resolve_provider_config, run_agent,
+    call_mcp_tool, compact_session, compact_summary_for_session, config_to_toml, init_project,
+    list_mcp_tools, load_config, load_mcp_config, resolve_provider_config, run_agent,
 };
 use luckcode_model::{
-    AnthropicProvider, Message, MessageRole, MockProvider, ModelEvent, ModelProvider, ModelRequest,
-    ModelRequestFormat, OpenAiCompatibleProvider, is_anthropic_provider,
-    is_openai_compatible_provider,
+    AnthropicProvider, Message, MessageRole, MockProvider, ModelEvent, ModelHttpOptions,
+    ModelProvider, ModelRequest, ModelRequestFormat, OpenAiCompatibleProvider,
+    is_anthropic_provider, is_openai_compatible_provider,
 };
 use luckcode_storage::{
     ProjectInfo, SessionInfo, append_session_checkpoint, append_session_message, create_checkpoint,
@@ -18,8 +18,9 @@ use luckcode_storage::{
     set_project_memory,
 };
 use luckcode_tools::{
-    AnnounceCommand, CommandApproval, CommandPreview, ConfirmCommand, CreateCheckpoint,
-    EditApproval, EditPreview, ToolCall, ToolContext, full_registry, readonly_registry,
+    AnnounceCommand, CommandApproval, CommandPolicyConfig, CommandPreview, ConfirmCommand,
+    CreateCheckpoint, EditApproval, EditPreview, ToolCall, ToolContext, full_registry,
+    readonly_registry,
 };
 use std::{
     env, fs,
@@ -156,7 +157,21 @@ enum MemoryCommand {
 #[derive(Debug, Subcommand)]
 enum McpCommand {
     List,
-    Show { name: String },
+    Show {
+        name: String,
+    },
+    Tools {
+        server: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
+    Call {
+        server: String,
+        tool: String,
+        input: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -219,7 +234,7 @@ async fn run() -> Result<()> {
         Some(Commands::Symbols { path, limit }) => handle_symbols(path, limit).await,
         Some(Commands::Session { command }) => handle_session(command),
         Some(Commands::Memory { command }) => handle_memory(command),
-        Some(Commands::Mcp { command }) => handle_mcp(command),
+        Some(Commands::Mcp { command }) => handle_mcp(command).await,
         Some(Commands::Restore { checkpoint_id }) => handle_restore(checkpoint_id),
         None if !cli.prompt.is_empty() => {
             run_prompt(
@@ -308,6 +323,7 @@ async fn handle_tools(command: ToolsCommand) -> Result<()> {
             let ctx = ToolContext::new(cwd, loaded.config.workspace.max_file_size)
                 .with_edit_approval(EditApproval::Prompt)
                 .with_command_approval(CommandApproval::Prompt)
+                .with_command_policy(command_policy_from_config(&loaded.config))
                 .with_confirm_edit(Arc::new(confirm_edit_stdin))
                 .with_confirm_command(Arc::new(confirm_command_stdin));
             let output = registry.execute(ToolCall { name, arguments }, ctx).await?;
@@ -367,6 +383,7 @@ async fn run_prompt(
         loaded.config.workspace.max_file_size,
         permission.edit_approval,
         permission.command_approval,
+        command_policy_from_config(&loaded.config),
         &session,
     );
     let result = run_agent(
@@ -463,6 +480,7 @@ async fn run_resumed_prompt(
         loaded.config.workspace.max_file_size,
         permission.edit_approval,
         permission.command_approval,
+        command_policy_from_config(&loaded.config),
         &session,
     );
     let result = run_agent(
@@ -574,11 +592,13 @@ fn build_tool_context(
     max_file_size: u64,
     edit_approval: EditApproval,
     command_approval: CommandApproval,
+    command_policy: CommandPolicyConfig,
     session: &SessionInfo,
 ) -> ToolContext {
     let mut ctx = ToolContext::new(cwd, max_file_size)
         .with_edit_approval(edit_approval)
-        .with_command_approval(command_approval);
+        .with_command_approval(command_approval)
+        .with_command_policy(command_policy);
     if edit_approval != EditApproval::Refuse {
         let session_for_checkpoint = session.clone();
         let create_checkpoint: CreateCheckpoint = Arc::new(move |files: &[PathBuf]| {
@@ -602,6 +622,14 @@ fn build_tool_context(
         }
     }
     ctx
+}
+
+fn command_policy_from_config(config: &AppConfig) -> CommandPolicyConfig {
+    config
+        .commands
+        .as_ref()
+        .map(|commands| commands.policy.clone())
+        .unwrap_or_default()
 }
 
 /// Print an edit preview and ask the user whether to apply it.
@@ -700,20 +728,24 @@ fn build_agent_provider(resolved: &ResolvedProviderConfig) -> Result<Box<dyn Mod
     }
 
     if is_anthropic_provider(&resolved.kind) {
-        return Ok(Box::new(AnthropicProvider::from_env_with_options(
+        return Ok(Box::new(AnthropicProvider::from_env_with_http_options(
             &resolved.model,
             resolved.base_url.as_deref(),
             resolved.api_key_env.as_deref(),
+            http_options_for_provider(resolved),
         )?));
     }
 
     if is_openai_compatible_provider(&resolved.kind) {
-        return Ok(Box::new(OpenAiCompatibleProvider::from_env_with_options(
-            &resolved.model,
-            openai_request_format_for_provider(resolved)?,
-            resolved.base_url.as_deref(),
-            resolved.api_key_env.as_deref(),
-        )?));
+        return Ok(Box::new(
+            OpenAiCompatibleProvider::from_env_with_http_options(
+                &resolved.model,
+                openai_request_format_for_provider(resolved)?,
+                resolved.base_url.as_deref(),
+                resolved.api_key_env.as_deref(),
+                http_options_for_provider(resolved),
+            )?,
+        ));
     }
 
     anyhow::bail!(
@@ -733,26 +765,39 @@ fn build_ask_provider(
     }
 
     if is_anthropic_provider(&resolved.kind) {
-        return Ok(Box::new(AnthropicProvider::from_env_with_options(
+        return Ok(Box::new(AnthropicProvider::from_env_with_http_options(
             &resolved.model,
             resolved.base_url.as_deref(),
             resolved.api_key_env.as_deref(),
+            http_options_for_provider(resolved),
         )?));
     }
 
     if is_openai_compatible_provider(&resolved.kind) {
-        return Ok(Box::new(OpenAiCompatibleProvider::from_env_with_options(
-            &resolved.model,
-            openai_request_format_for_provider(resolved)?,
-            resolved.base_url.as_deref(),
-            resolved.api_key_env.as_deref(),
-        )?));
+        return Ok(Box::new(
+            OpenAiCompatibleProvider::from_env_with_http_options(
+                &resolved.model,
+                openai_request_format_for_provider(resolved)?,
+                resolved.base_url.as_deref(),
+                resolved.api_key_env.as_deref(),
+                http_options_for_provider(resolved),
+            )?,
+        ));
     }
 
     anyhow::bail!(
         "provider '{}' is not implemented yet; use 'mock', 'openai', 'responses', or 'anthropic'",
         resolved.name
     )
+}
+
+fn http_options_for_provider(resolved: &ResolvedProviderConfig) -> ModelHttpOptions {
+    let defaults = ModelHttpOptions::default();
+    ModelHttpOptions {
+        timeout_seconds: resolved.timeout_seconds.unwrap_or(defaults.timeout_seconds),
+        retry_attempts: resolved.retry_attempts.unwrap_or(defaults.retry_attempts),
+    }
+    .normalized()
 }
 
 fn openai_request_format_for_provider(
@@ -812,7 +857,7 @@ fn print_providers(config: &AppConfig) {
     let active = resolve_provider_config(config, None, None)
         .map(|provider| provider.name)
         .unwrap_or_else(|_| config.model.provider.clone());
-    println!("NAME\tKIND\tMODEL\tFORMAT\tENABLED\tACTIVE");
+    println!("NAME\tKIND\tMODEL\tFORMAT\tTIMEOUT\tRETRIES\tENABLED\tACTIVE");
     for (name, profile) in &config.providers {
         let inferred = resolve_provider_config(config, Some(name), None).ok();
         let kind = profile
@@ -826,9 +871,27 @@ fn print_providers(config: &AppConfig) {
             .or_else(|| inferred.as_ref().map(|provider| provider.model.as_str()))
             .unwrap_or("");
         let format = profile.request_format.as_deref().unwrap_or("");
+        let timeout = profile
+            .timeout_seconds
+            .or_else(|| {
+                inferred
+                    .as_ref()
+                    .and_then(|provider| provider.timeout_seconds)
+            })
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let retries = profile
+            .retry_attempts
+            .or_else(|| {
+                inferred
+                    .as_ref()
+                    .and_then(|provider| provider.retry_attempts)
+            })
+            .map(|value| value.to_string())
+            .unwrap_or_default();
         let active_marker = if name == &active { "*" } else { "" };
         println!(
-            "{name}\t{kind}\t{model}\t{format}\t{}\t{active_marker}",
+            "{name}\t{kind}\t{model}\t{format}\t{timeout}\t{retries}\t{}\t{active_marker}",
             profile.enabled
         );
     }
@@ -941,7 +1004,7 @@ fn handle_memory(command: MemoryCommand) -> Result<()> {
     }
 }
 
-fn handle_mcp(command: McpCommand) -> Result<()> {
+async fn handle_mcp(command: McpCommand) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let loaded = load_mcp_config(&cwd)?;
 
@@ -994,6 +1057,47 @@ fn handle_mcp(command: McpCommand) -> Result<()> {
                     println!("- {key}=<redacted>");
                 }
             }
+            Ok(())
+        }
+        McpCommand::Tools {
+            server,
+            timeout_seconds,
+        } => {
+            let server_config = loaded
+                .config
+                .servers
+                .get(&server)
+                .with_context(|| format!("MCP server '{server}' is not configured"))?;
+            let tools = list_mcp_tools(server_config, timeout_seconds).await?;
+            if tools.is_empty() {
+                println!("No tools reported by MCP server {server}.");
+                return Ok(());
+            }
+            println!("NAME\tDESCRIPTION");
+            for tool in tools {
+                println!("{}\t{}", tool.name, tool.description.unwrap_or_default());
+            }
+            Ok(())
+        }
+        McpCommand::Call {
+            server,
+            tool,
+            input,
+            timeout_seconds,
+        } => {
+            let server_config = loaded
+                .config
+                .servers
+                .get(&server)
+                .with_context(|| format!("MCP server '{server}' is not configured"))?;
+            let arguments =
+                serde_json::from_str(&input).context("MCP tool input must be valid JSON")?;
+            let result = call_mcp_tool(server_config, &tool, arguments, timeout_seconds).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result)
+                    .context("failed to serialize MCP tool result")?
+            );
             Ok(())
         }
     }

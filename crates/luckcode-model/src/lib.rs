@@ -3,10 +3,11 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, env, pin::Pin};
+use std::{collections::HashMap, env, pin::Pin, time::Duration};
+use tokio::time;
 
 pub type ModelStream = Pin<Box<dyn Stream<Item = Result<ModelEvent>> + Send>>;
 
@@ -67,6 +68,36 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+const DEFAULT_MODEL_TIMEOUT_SECONDS: u64 = 120;
+const MAX_MODEL_TIMEOUT_SECONDS: u64 = 600;
+const DEFAULT_MODEL_RETRY_ATTEMPTS: u8 = 2;
+const MAX_MODEL_RETRY_ATTEMPTS: u8 = 5;
+const MAX_ERROR_BODY_CHARS: usize = 2_000;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelHttpOptions {
+    pub timeout_seconds: u64,
+    pub retry_attempts: u8,
+}
+
+impl Default for ModelHttpOptions {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: DEFAULT_MODEL_TIMEOUT_SECONDS,
+            retry_attempts: DEFAULT_MODEL_RETRY_ATTEMPTS,
+        }
+    }
+}
+
+impl ModelHttpOptions {
+    pub fn normalized(self) -> Self {
+        Self {
+            timeout_seconds: self.timeout_seconds.clamp(1, MAX_MODEL_TIMEOUT_SECONDS),
+            retry_attempts: self.retry_attempts.min(MAX_MODEL_RETRY_ATTEMPTS),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MockProvider {
     mode: MockMode,
@@ -117,6 +148,7 @@ pub struct OpenAiCompatibleProvider {
     api_key: String,
     model: String,
     request_format: ModelRequestFormat,
+    retry_attempts: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +183,25 @@ impl OpenAiCompatibleProvider {
             api_key: api_key.into(),
             model: model.into(),
             request_format: ModelRequestFormat::OpenAiChatCompletions,
+            retry_attempts: ModelHttpOptions::default().retry_attempts,
         }
+    }
+
+    pub fn new_with_http_options(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        http_options: ModelHttpOptions,
+    ) -> Result<Self> {
+        let http_options = http_options.normalized();
+        Ok(Self {
+            client: http_client(http_options)?,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            api_key: api_key.into(),
+            model: model.into(),
+            request_format: ModelRequestFormat::OpenAiChatCompletions,
+            retry_attempts: http_options.retry_attempts,
+        })
     }
 
     pub fn with_request_format(mut self, request_format: ModelRequestFormat) -> Self {
@@ -179,6 +229,22 @@ impl OpenAiCompatibleProvider {
         base_url: Option<&str>,
         api_key_env: Option<&str>,
     ) -> Result<Self> {
+        Self::from_env_with_http_options(
+            model,
+            request_format,
+            base_url,
+            api_key_env,
+            ModelHttpOptions::default(),
+        )
+    }
+
+    pub fn from_env_with_http_options(
+        model: impl Into<String>,
+        request_format: ModelRequestFormat,
+        base_url: Option<&str>,
+        api_key_env: Option<&str>,
+        http_options: ModelHttpOptions,
+    ) -> Result<Self> {
         let api_key = read_api_key(
             api_key_env,
             &["LUCKCODE_OPENAI_API_KEY", "OPENAI_API_KEY"],
@@ -189,7 +255,10 @@ impl OpenAiCompatibleProvider {
             .or_else(|| env::var("LUCKCODE_OPENAI_BASE_URL").ok())
             .or_else(|| env::var("OPENAI_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        Ok(Self::new(base_url, api_key, model).with_request_format(request_format))
+        Ok(
+            Self::new_with_http_options(base_url, api_key, model, http_options)?
+                .with_request_format(request_format),
+        )
     }
 }
 
@@ -210,16 +279,13 @@ impl ModelProvider for OpenAiCompatibleProvider {
             }
         };
         let url = format!("{}/{}", self.base_url, path);
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to send OpenAI-compatible request")?
-            .error_for_status()
-            .context("OpenAI-compatible request failed")?;
+        let response = send_request_with_retries("OpenAI-compatible", self.retry_attempts, || {
+            self.client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+        })
+        .await?;
         let mut byte_stream = response.bytes_stream();
 
         let event_stream = try_stream! {
@@ -300,6 +366,7 @@ pub struct AnthropicProvider {
     api_key: String,
     model: String,
     version: String,
+    retry_attempts: u8,
 }
 
 impl AnthropicProvider {
@@ -315,7 +382,26 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             model: model.into(),
             version: version.into(),
+            retry_attempts: ModelHttpOptions::default().retry_attempts,
         }
+    }
+
+    pub fn new_with_http_options(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        version: impl Into<String>,
+        http_options: ModelHttpOptions,
+    ) -> Result<Self> {
+        let http_options = http_options.normalized();
+        Ok(Self {
+            client: http_client(http_options)?,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            api_key: api_key.into(),
+            model: model.into(),
+            version: version.into(),
+            retry_attempts: http_options.retry_attempts,
+        })
     }
 
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
@@ -326,6 +412,15 @@ impl AnthropicProvider {
         model: impl Into<String>,
         base_url: Option<&str>,
         api_key_env: Option<&str>,
+    ) -> Result<Self> {
+        Self::from_env_with_http_options(model, base_url, api_key_env, ModelHttpOptions::default())
+    }
+
+    pub fn from_env_with_http_options(
+        model: impl Into<String>,
+        base_url: Option<&str>,
+        api_key_env: Option<&str>,
+        http_options: ModelHttpOptions,
     ) -> Result<Self> {
         let api_key = read_api_key(
             api_key_env,
@@ -340,7 +435,7 @@ impl AnthropicProvider {
         let version =
             env::var("LUCKCODE_ANTHROPIC_VERSION").unwrap_or_else(|_| "2023-06-01".to_string());
 
-        Ok(Self::new(base_url, api_key, model, version))
+        Self::new_with_http_options(base_url, api_key, model, version, http_options)
     }
 }
 
@@ -349,17 +444,14 @@ impl ModelProvider for AnthropicProvider {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream> {
         let url = anthropic_messages_url(&self.base_url);
         let body = anthropic_messages_request(&self.model, &request);
-        let response = self
-            .client
-            .post(url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", &self.version)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to send Anthropic request")?
-            .error_for_status()
-            .context("Anthropic request failed")?;
+        let response = send_request_with_retries("Anthropic", self.retry_attempts, || {
+            self.client
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", &self.version)
+                .json(&body)
+        })
+        .await?;
         let mut byte_stream = response.bytes_stream();
 
         let event_stream = try_stream! {
@@ -398,6 +490,93 @@ impl ModelProvider for AnthropicProvider {
 
         Ok(Box::pin(event_stream))
     }
+}
+
+fn http_client(options: ModelHttpOptions) -> Result<Client> {
+    let options = options.normalized();
+    Client::builder()
+        .timeout(Duration::from_secs(options.timeout_seconds))
+        .build()
+        .context("failed to build HTTP client")
+}
+
+async fn send_request_with_retries<F>(
+    provider: &str,
+    retry_attempts: u8,
+    mut build_request: F,
+) -> Result<Response>
+where
+    F: FnMut() -> RequestBuilder,
+{
+    let retry_attempts = retry_attempts.min(MAX_MODEL_RETRY_ATTEMPTS);
+    for attempt in 0..=retry_attempts {
+        match build_request().send().await {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) => {
+                let status = response.status();
+                let should_retry = is_retryable_status(status) && attempt < retry_attempts;
+                let error = http_status_error(provider, status, response).await;
+                if should_retry {
+                    sleep_before_retry(attempt).await;
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) => {
+                let should_retry =
+                    (error.is_timeout() || error.is_connect()) && attempt < retry_attempts;
+                let message = error.to_string();
+                if should_retry {
+                    sleep_before_retry(attempt).await;
+                    continue;
+                }
+                anyhow::bail!(
+                    "failed to send {provider} request after {} attempt(s): {message}",
+                    attempt + 1
+                );
+            }
+        }
+    }
+
+    anyhow::bail!("failed to send {provider} request")
+}
+
+async fn http_status_error(
+    provider: &str,
+    status: StatusCode,
+    response: Response,
+) -> anyhow::Error {
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("failed to read error body: {error}"));
+    let body = compact_error_body(&body, MAX_ERROR_BODY_CHARS);
+    if body.is_empty() {
+        anyhow::anyhow!("{provider} request failed with HTTP {status}")
+    } else {
+        anyhow::anyhow!("{provider} request failed with HTTP {status}: {body}")
+    }
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+async fn sleep_before_retry(attempt: u8) {
+    let multiplier = 1_u64 << u32::from(attempt.min(4));
+    time::sleep(Duration::from_millis(250 * multiplier)).await;
+}
+
+fn compact_error_body(body: &str, max_chars: usize) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut truncated = compact.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 pub fn is_openai_compatible_provider(provider: &str) -> bool {
@@ -1374,5 +1553,35 @@ mod tests {
         assert_eq!(call.id.as_deref(), Some("toolu_1"));
         assert_eq!(call.name, "read_file");
         assert_eq!(call.arguments, json!({ "path": "Cargo.toml" }));
+    }
+
+    #[test]
+    fn http_options_are_clamped_to_supported_bounds() {
+        let options = ModelHttpOptions {
+            timeout_seconds: 10_000,
+            retry_attempts: 99,
+        }
+        .normalized();
+
+        assert_eq!(options.timeout_seconds, MAX_MODEL_TIMEOUT_SECONDS);
+        assert_eq!(options.retry_attempts, MAX_MODEL_RETRY_ATTEMPTS);
+    }
+
+    #[test]
+    fn retryable_statuses_cover_rate_limits_and_server_errors() {
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn compact_error_body_collapses_and_truncates_text() {
+        let body = "line one\n\nline two   line three";
+        assert_eq!(compact_error_body(body, 80), "line one line two line three");
+
+        let truncated = compact_error_body("abcdef", 3);
+        assert_eq!(truncated, "abc...");
     }
 }

@@ -1155,12 +1155,13 @@ luckcode restore
 
 ### v0.3：可验证 Coding Agent
 
-> 状态：第一版已实现 `run_shell`、命令权限策略、危险命令拦截、超时和输出截断；测试失败后的自动重试策略仍需继续细化。
+> 状态：第一版已实现 `run_shell`、命令权限策略、危险命令拦截、配置化 allowlist / denylist / default policy、超时和输出截断；测试失败后的自动重试策略仍需继续细化。
 
 能力：
 
 - `run_shell`（已实现）
 - 第一版权限系统（`CommandPolicy` / `PermissionEngine`、已实现）
+- 命令 allowlist / denylist / default policy 配置（已实现）
 - 测试验证（可通过 `run_shell` 执行配置的测试命令）
 - 失败重试（Agent Loop 可基于 tool result 继续迭代，后续补更明确策略）
 
@@ -1207,11 +1208,12 @@ luckcode "解释这个函数的调用链"
 
 ### v0.6：MCP
 
-> 状态：配置检查基础版已实现。当前支持 `luckcode mcp list/show` 读取 `.luckcode/mcp.json` 并隐藏 env 值；stdio tool discovery / tool call 仍需继续实现。
+> 状态：stdio 基础版已实现。当前支持 `luckcode mcp list/show` 读取 `.luckcode/mcp.json` 并隐藏 env 值，也支持 `luckcode mcp tools <server>` 和 `luckcode mcp call <server> <tool> <json>` 启动 stdio MCP server 做 tool discovery / tool call；HTTP transport、Agent tool registry 集成和 MCP 权限细化仍需继续实现。
 
 能力：
 
-- MCP client（配置检查基础版已实现）
+- MCP client（stdio 基础版已实现）
+- MCP tool discovery / tool call（stdio 基础版已实现）
 - MCP tool registry（后续）
 - MCP permission（后续）
 

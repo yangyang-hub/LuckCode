@@ -281,7 +281,7 @@ pub trait Tool: Send + Sync {
 ## 10. 配置系统约定（落实计划 §7）
 
 - 配置优先级（高到低）：**命令行参数 → 环境变量 → 项目 `.luckcode/config.toml` → 全局 `~/.config/luckcode/config.toml` → 默认值**。新增任何配置项都必须明确它落在哪一层，且高层覆盖低层。
-- 环境变量统一 `LUCKCODE_` 前缀；既有约定：`LUCKCODE_PROVIDER` / `LUCKCODE_MODEL_PROVIDER`、`LUCKCODE_MODEL`、`LUCKCODE_PERMISSION_MODE`、`LUCKCODE_MODEL_REQUEST_FORMAT`、`LUCKCODE_<PROVIDER>_API_KEY`、`LUCKCODE_<PROVIDER>_BASE_URL`。新增变量遵循同样命名。
+- 环境变量统一 `LUCKCODE_` 前缀；既有约定：`LUCKCODE_PROVIDER` / `LUCKCODE_MODEL_PROVIDER`、`LUCKCODE_MODEL`、`LUCKCODE_PERMISSION_MODE`、`LUCKCODE_MODEL_REQUEST_FORMAT`、`LUCKCODE_MODEL_TIMEOUT_SECONDS`、`LUCKCODE_MODEL_RETRY_ATTEMPTS`、`LUCKCODE_<PROVIDER>_API_KEY`、`LUCKCODE_<PROVIDER>_BASE_URL`。新增变量遵循同样命名。
 - `init` 生成的模板（`AGENTS_TEMPLATE` / `PROJECT_CONFIG_TEMPLATE` / `MCP_CONFIG_TEMPLATE` / `IGNORE_TEMPLATE`）以 `const &str` 集中维护，修改模板要同步更新 `README.md` 和本规范相关示例。
 - `config show` 必须能输出合并后的最终配置 + 各来源加载状态（`ConfigSource { path, loaded }`），便于排错。
 
@@ -305,7 +305,7 @@ pub trait Tool: Send + Sync {
 
 - **只读 vs 可写工具严格分离**：只读工具（list/read/search/detect/git_status/git_diff/list_symbols）可自动执行；可写/执行类（`edit_file`、`write_file`、`run_shell`、`delete_file`、MCP 工具）必须经过权限系统。
 - **默认拒绝清单**（计划 §8）：`sudo`、`rm -rf`、`chmod -R 777`、`curl ... | sh`、`wget ... | bash`、`dd`、`mkfs`、`docker system prune`、`terraform apply`、`terraform destroy`、`kubectl delete`、引用 `.env` / 私钥 / 凭据路径的命令等。命中即 `Deny`，不询问。
-- 第一版里除 `git status` / `git diff` 外的 shell 命令，**默认先询问用户**；`auto` / `dangerous` 模式下仍必须在执行前展示命令，且硬拒绝清单始终生效。
+- `run_shell` 权限顺序为：硬拒绝清单 → 配置 denylist → 配置 allowlist → 配置 `default_policy` 或当前权限模式。第一版默认 allowlist 包含 `git status` / `git diff`；其它 shell 命令默认先询问用户。`auto` / `dangerous` 模式下仍必须在执行前展示命令，且硬拒绝清单始终生效。
 - `run_shell` 必须固定在 workspace root 下执行，使用 `tokio::process::Command`，提供超时控制和 stdout/stderr 截断；非零退出码作为 tool result 返回给 Agent，不当作工具崩溃。
 - 文件编辑流程已落地：`read_file` → 精确字符串替换 → 本地校验 → 展示 diff → 按 `EditApproval` 确认 → 建 checkpoint → apply（计划 §9）。**不允许模型输出直接覆盖整个文件**。审批不通过独立的 PermissionEngine（那是第 7 周），而是由 CLI 把 `PermissionMode` 映射成 `EditApproval` 注入 `ToolContext`，编辑工具内部据此 Refuse/Prompt/Auto。
 - 路径越界检查、敏感文件跳过、文件大小上限见 §7.3。

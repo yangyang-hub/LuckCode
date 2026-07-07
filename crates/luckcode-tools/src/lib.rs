@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 use std::{
@@ -77,6 +77,7 @@ pub struct ToolContext {
     pub max_file_size: u64,
     pub edit_approval: EditApproval,
     pub command_approval: CommandApproval,
+    pub command_policy: CommandPolicyConfig,
     pub confirm_edit: Option<ConfirmEdit>,
     pub confirm_command: Option<ConfirmCommand>,
     pub announce_command: Option<AnnounceCommand>,
@@ -90,6 +91,7 @@ impl fmt::Debug for ToolContext {
             .field("max_file_size", &self.max_file_size)
             .field("edit_approval", &self.edit_approval)
             .field("command_approval", &self.command_approval)
+            .field("command_policy", &self.command_policy)
             .field("confirm_edit", &self.confirm_edit.is_some())
             .field("confirm_command", &self.confirm_command.is_some())
             .field("announce_command", &self.announce_command.is_some())
@@ -105,6 +107,7 @@ impl ToolContext {
             max_file_size,
             edit_approval: EditApproval::Refuse,
             command_approval: CommandApproval::Refuse,
+            command_policy: CommandPolicyConfig::default(),
             confirm_edit: None,
             confirm_command: None,
             announce_command: None,
@@ -119,6 +122,11 @@ impl ToolContext {
 
     pub fn with_command_approval(mut self, approval: CommandApproval) -> Self {
         self.command_approval = approval;
+        self
+    }
+
+    pub fn with_command_policy(mut self, policy: CommandPolicyConfig) -> Self {
+        self.command_policy = policy;
         self
     }
 
@@ -943,11 +951,30 @@ const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 20_000;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 100_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub enum CommandPolicy {
     Allow,
     Ask,
     Deny,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CommandPolicyConfig {
+    pub default_policy: Option<CommandPolicy>,
+    pub allowlist: Vec<String>,
+    pub denylist: Vec<String>,
+}
+
+impl Default for CommandPolicyConfig {
+    fn default() -> Self {
+        Self {
+            default_policy: None,
+            allowlist: vec!["git status".to_string(), "git diff".to_string()],
+            denylist: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -972,7 +999,11 @@ impl PermissionEngine {
         Self { default_policy }
     }
 
-    pub fn evaluate_command(&self, command: &str) -> CommandPolicyDecision {
+    pub fn evaluate_command(
+        &self,
+        command: &str,
+        config: &CommandPolicyConfig,
+    ) -> CommandPolicyDecision {
         if let Some(reason) = hard_deny_reason(command) {
             return CommandPolicyDecision {
                 policy: CommandPolicy::Deny,
@@ -980,7 +1011,22 @@ impl PermissionEngine {
             };
         }
 
-        match self.default_policy {
+        if let Some(pattern) = first_matching_command_pattern(command, &config.denylist) {
+            return CommandPolicyDecision {
+                policy: CommandPolicy::Deny,
+                reason: format!("command denied by configured pattern '{pattern}'"),
+            };
+        }
+
+        if let Some(pattern) = first_matching_command_pattern(command, &config.allowlist) {
+            return CommandPolicyDecision {
+                policy: CommandPolicy::Allow,
+                reason: format!("command allowed by configured pattern '{pattern}'"),
+            };
+        }
+
+        let policy = config.default_policy.unwrap_or(self.default_policy);
+        match policy {
             CommandPolicy::Allow => CommandPolicyDecision {
                 policy: CommandPolicy::Allow,
                 reason: "command allowed by permission mode".to_string(),
@@ -1093,7 +1139,16 @@ fn authorize_command(
         CommandApproval::Prompt => CommandPolicy::Ask,
         CommandApproval::Auto => CommandPolicy::Allow,
     };
-    let decision = PermissionEngine::new(default_policy).evaluate_command(command);
+    let policy_config = if ctx.command_approval == CommandApproval::Refuse {
+        CommandPolicyConfig {
+            default_policy: None,
+            allowlist: Vec::new(),
+            denylist: ctx.command_policy.denylist.clone(),
+        }
+    } else {
+        ctx.command_policy.clone()
+    };
+    let decision = PermissionEngine::new(default_policy).evaluate_command(command, &policy_config);
     let preview = CommandPreview {
         command: command.to_string(),
         working_dir: working_dir.to_path_buf(),
@@ -1274,6 +1329,25 @@ fn hard_deny_reason(command: &str) -> Option<String> {
     }
 
     None
+}
+
+fn first_matching_command_pattern<'a>(command: &str, patterns: &'a [String]) -> Option<&'a str> {
+    patterns
+        .iter()
+        .map(String::as_str)
+        .find(|pattern| command_matches_pattern(command, pattern))
+}
+
+fn command_matches_pattern(command: &str, pattern: &str) -> bool {
+    let command = command.trim();
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return command.starts_with(prefix.trim_end());
+    }
+    command == pattern || command.starts_with(&format!("{pattern} "))
 }
 
 fn references_sensitive_path(command: &str) -> bool {
@@ -2057,15 +2131,42 @@ mod tests {
 
     #[test]
     fn permission_engine_asks_for_normal_command_by_default() {
-        let decision = PermissionEngine::default().evaluate_command("cargo test");
+        let decision = PermissionEngine::default()
+            .evaluate_command("cargo test", &CommandPolicyConfig::default());
 
         assert_eq!(decision.policy, CommandPolicy::Ask);
         assert!(decision.reason.contains("confirmation"));
     }
 
     #[test]
+    fn permission_engine_allows_configured_safe_git_commands() {
+        let decision = PermissionEngine::default()
+            .evaluate_command("git status --short", &CommandPolicyConfig::default());
+
+        assert_eq!(decision.policy, CommandPolicy::Allow);
+        assert!(decision.reason.contains("git status"));
+    }
+
+    #[test]
+    fn permission_engine_uses_configured_denylist_and_default_policy() {
+        let config = CommandPolicyConfig {
+            default_policy: Some(CommandPolicy::Allow),
+            allowlist: Vec::new(),
+            denylist: vec!["npm publish".to_string()],
+        };
+
+        let denied =
+            PermissionEngine::default().evaluate_command("npm publish --access public", &config);
+        let allowed = PermissionEngine::default().evaluate_command("cargo test", &config);
+
+        assert_eq!(denied.policy, CommandPolicy::Deny);
+        assert_eq!(allowed.policy, CommandPolicy::Allow);
+    }
+
+    #[test]
     fn permission_engine_denies_dangerous_commands() {
         let engine = PermissionEngine::new(CommandPolicy::Allow);
+        let config = CommandPolicyConfig::default();
 
         for command in [
             "sudo cargo test",
@@ -2081,7 +2182,7 @@ mod tests {
             "kubectl delete pod app",
             "cat .env",
         ] {
-            let decision = engine.evaluate_command(command);
+            let decision = engine.evaluate_command(command, &config);
             assert_eq!(decision.policy, CommandPolicy::Deny, "{command}");
         }
     }

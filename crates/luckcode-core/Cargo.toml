@@ -7,10 +7,15 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 futures-util.workspace = true
+ignore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 toml.workspace = true
 
 luckcode-model.workspace = true
 luckcode-storage.workspace = true
 luckcode-tools.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

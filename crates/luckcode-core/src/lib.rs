@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::BoxFuture};
+use ignore::WalkBuilder;
 use luckcode_model::{
     Message, MessageRole, ModelEvent, ModelProvider, ModelRequest, ToolCall as ModelToolCall,
     ToolSchema,
@@ -8,13 +9,19 @@ use luckcode_storage::{
     SessionInfo, append_session_compact_summary, append_session_message, append_session_tool_call,
     append_session_tool_result, project_hash, read_project_memory, read_session_events,
 };
-use luckcode_tools::{ToolCall as LocalToolCall, ToolContext, ToolRegistry};
+use luckcode_tools::{CommandPolicyConfig, ToolCall as LocalToolCall, ToolContext, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    process::Stdio,
+};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines},
+    process::{ChildStdin, ChildStdout, Command as TokioCommand},
+    time::{self, Duration},
 };
 
 #[derive(Debug, Clone)]
@@ -262,6 +269,36 @@ pub fn build_project_context(workspace_root: &Path, max_file_size: u64) -> Resul
                 out.push_str(&relative.display().to_string());
                 out.push('\n');
             }
+        }
+    }
+
+    let top_level_entries = top_level_context_entries(workspace_root, 24);
+    if !top_level_entries.is_empty() {
+        out.push_str("- Workspace top-level:\n");
+        for entry in top_level_entries {
+            out.push_str("  - ");
+            out.push_str(&entry);
+            out.push('\n');
+        }
+    }
+
+    let command_hints = command_hints(workspace_root);
+    if !command_hints.is_empty() {
+        out.push_str("- Command hints:\n");
+        for hint in command_hints {
+            out.push_str("  - ");
+            out.push_str(&hint);
+            out.push('\n');
+        }
+    }
+
+    let source_files = source_file_overview(workspace_root, 40);
+    if !source_files.is_empty() {
+        out.push_str("- Source overview:\n");
+        for file in source_files {
+            out.push_str("  - ");
+            out.push_str(&file);
+            out.push('\n');
         }
     }
 
@@ -559,6 +596,7 @@ fn important_context_files(root: &Path) -> Vec<PathBuf> {
     [
         "README.md",
         "AGENTS.md",
+        "CLAUDE.md",
         "Cargo.toml",
         "package.json",
         "pom.xml",
@@ -573,6 +611,151 @@ fn important_context_files(root: &Path) -> Vec<PathBuf> {
     .map(|file| root.join(file))
     .filter(|path| path.exists() && path.is_file())
     .collect()
+}
+
+fn top_level_context_entries(root: &Path, limit: usize) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut entries = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy().to_string();
+            if should_skip_context_name(&name) || is_sensitive_path(&path) {
+                return None;
+            }
+            let suffix = if entry.file_type().ok()?.is_dir() {
+                "/"
+            } else {
+                ""
+            };
+            Some(format!("{name}{suffix}"))
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.truncate(limit);
+    entries
+}
+
+fn command_hints(root: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    if let Ok(loaded) = load_config(root)
+        && let Some(configured) = loaded.config.commands
+    {
+        push_command_hint(&mut commands, "test", configured.test);
+        push_command_hint(&mut commands, "check", configured.check);
+        push_command_hint(&mut commands, "lint", configured.lint);
+    }
+
+    if root.join("Cargo.toml").exists() {
+        push_unique(&mut commands, "test: cargo test".to_string());
+        push_unique(&mut commands, "check: cargo check".to_string());
+        push_unique(&mut commands, "lint: cargo clippy".to_string());
+    }
+    if root.join("package.json").exists() {
+        push_unique(&mut commands, "test: npm test".to_string());
+    }
+    if root.join("pom.xml").exists() {
+        push_unique(&mut commands, "test: mvn test".to_string());
+    }
+    if root.join("build.gradle").exists() || root.join("build.gradle.kts").exists() {
+        push_unique(&mut commands, "test: ./gradlew test".to_string());
+    }
+    if root.join("go.mod").exists() {
+        push_unique(&mut commands, "test: go test ./...".to_string());
+    }
+    if root.join("pyproject.toml").exists() {
+        push_unique(&mut commands, "test: pytest".to_string());
+    }
+
+    commands
+}
+
+fn push_command_hint(commands: &mut Vec<String>, label: &str, command: Option<String>) {
+    if let Some(command) = command
+        && !command.trim().is_empty()
+    {
+        push_unique(commands, format!("{label}: {command}"));
+    }
+}
+
+fn source_file_overview(root: &Path, limit: usize) -> Vec<String> {
+    let mut files = Vec::new();
+    let walker = WalkBuilder::new(root)
+        .max_depth(Some(5))
+        .git_ignore(true)
+        .git_exclude(true)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !should_skip_context_name(&name)
+        })
+        .build();
+
+    for result in walker {
+        let Ok(entry) = result else {
+            continue;
+        };
+        let path = entry.path();
+        if files.len() >= limit {
+            break;
+        }
+        if !path.is_file() || is_sensitive_path(path) || !is_source_context_file(path) {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        files.push(format!("{} ({} bytes)", relative.display(), size));
+    }
+
+    files
+}
+
+fn is_source_context_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some(
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "py"
+                | "go"
+                | "java"
+                | "kt"
+                | "kts"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "h"
+                | "hpp"
+                | "cs"
+                | "rb"
+                | "php"
+                | "swift"
+                | "scala"
+                | "sql"
+        )
+    )
+}
+
+fn should_skip_context_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".hg"
+            | ".svn"
+            | ".luckcode"
+            | "target"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".cache"
+            | "coverage"
+    )
 }
 
 fn contains_extension(root: &Path, extension: &str) -> bool {
@@ -708,6 +891,8 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub request_format: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub retry_attempts: Option<u8>,
     pub enabled: bool,
 }
 
@@ -719,6 +904,8 @@ impl Default for ProviderConfig {
             base_url: None,
             api_key_env: None,
             request_format: None,
+            timeout_seconds: None,
+            retry_attempts: None,
             enabled: true,
         }
     }
@@ -732,6 +919,8 @@ pub struct ResolvedProviderConfig {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub request_format: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub retry_attempts: Option<u8>,
 }
 
 pub fn resolve_provider_config(
@@ -788,6 +977,12 @@ pub fn resolve_provider_config(
         request_format: profile
             .and_then(|profile| profile.request_format.clone())
             .or(inferred.request_format),
+        timeout_seconds: env_u64("LUCKCODE_MODEL_TIMEOUT_SECONDS")
+            .or_else(|| profile.and_then(|profile| profile.timeout_seconds))
+            .or(inferred.timeout_seconds),
+        retry_attempts: env_u8("LUCKCODE_MODEL_RETRY_ATTEMPTS")
+            .or_else(|| profile.and_then(|profile| profile.retry_attempts))
+            .or(inferred.retry_attempts),
     })
 }
 
@@ -924,11 +1119,13 @@ pub struct ProjectConfig {
     pub language: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct CommandConfig {
     pub test: Option<String>,
     pub check: Option<String>,
     pub lint: Option<String>,
+    pub policy: CommandPolicyConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -959,6 +1156,14 @@ pub struct LoadedMcpConfig {
     pub path: PathBuf,
     pub loaded: bool,
     pub config: McpConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpToolInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -1004,6 +1209,259 @@ pub fn load_mcp_config(workspace_root: impl AsRef<Path>) -> Result<LoadedMcpConf
         loaded: true,
         config,
     })
+}
+
+pub async fn list_mcp_tools(
+    server: &McpServerConfig,
+    timeout_seconds: u64,
+) -> Result<Vec<McpToolInfo>> {
+    let result = with_mcp_stdio_session(server, timeout_seconds, |stdin, reader| {
+        Box::pin(async move {
+            initialize_mcp(stdin, reader).await?;
+            send_mcp_request(stdin, 2, "tools/list", serde_json::json!({})).await?;
+            read_mcp_response(reader, 2).await
+        })
+    })
+    .await?;
+
+    parse_mcp_tools_result(&result)
+}
+
+pub async fn call_mcp_tool(
+    server: &McpServerConfig,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    timeout_seconds: u64,
+) -> Result<serde_json::Value> {
+    if tool_name.trim().is_empty() {
+        anyhow::bail!("MCP tool name cannot be empty");
+    }
+
+    let tool_name = tool_name.to_string();
+    with_mcp_stdio_session(server, timeout_seconds, move |stdin, reader| {
+        Box::pin(async move {
+            initialize_mcp(stdin, reader).await?;
+            send_mcp_request(
+                stdin,
+                2,
+                "tools/call",
+                serde_json::json!({
+                    "name": tool_name,
+                    "arguments": arguments,
+                }),
+            )
+            .await?;
+            read_mcp_response(reader, 2).await
+        })
+    })
+    .await
+}
+
+async fn with_mcp_stdio_session<F>(
+    server: &McpServerConfig,
+    timeout_seconds: u64,
+    operation: F,
+) -> Result<serde_json::Value>
+where
+    F: for<'a> FnOnce(
+        &'a mut ChildStdin,
+        &'a mut Lines<BufReader<ChildStdout>>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>,
+{
+    if server.disabled {
+        anyhow::bail!("MCP server is disabled");
+    }
+    if server.url.is_some() {
+        anyhow::bail!("HTTP MCP transport is not implemented yet; configure a stdio server");
+    }
+    let command_name = server
+        .command
+        .as_deref()
+        .context("MCP stdio server requires a command")?;
+
+    let mut command = TokioCommand::new(command_name);
+    command
+        .args(&server.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    for (key, value) in &server.env {
+        command.env(key, value);
+    }
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start MCP server command '{command_name}'"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to open MCP server stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to open MCP server stdout")?;
+    let mut reader = BufReader::new(stdout).lines();
+    let timeout_seconds = timeout_seconds.clamp(1, 120);
+
+    let result = time::timeout(
+        Duration::from_secs(timeout_seconds),
+        operation(&mut stdin, &mut reader),
+    )
+    .await;
+    let _ = child.kill().await;
+
+    match result {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("MCP request timed out after {timeout_seconds}s"),
+    }
+}
+
+async fn initialize_mcp<W, R>(stdin: &mut W, reader: &mut Lines<R>) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+{
+    send_mcp_request(
+        stdin,
+        1,
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "luckcode",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }),
+    )
+    .await?;
+    read_mcp_response(reader, 1).await?;
+    send_mcp_notification(stdin, "notifications/initialized", serde_json::json!({})).await
+}
+
+async fn send_mcp_request<W>(
+    stdin: &mut W,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let message = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    write_mcp_message(stdin, &message).await
+}
+
+async fn send_mcp_notification<W>(
+    stdin: &mut W,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let message = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    });
+    write_mcp_message(stdin, &message).await
+}
+
+async fn write_mcp_message<W>(stdin: &mut W, message: &serde_json::Value) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let line = serde_json::to_string(message).context("failed to serialize MCP message")?;
+    stdin
+        .write_all(line.as_bytes())
+        .await
+        .context("failed to write MCP message")?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .context("failed to write MCP newline")?;
+    stdin.flush().await.context("failed to flush MCP stdin")
+}
+
+async fn read_mcp_response<R>(reader: &mut Lines<R>, expected_id: u64) -> Result<serde_json::Value>
+where
+    R: AsyncBufRead + Unpin,
+{
+    while let Some(line) = reader
+        .next_line()
+        .await
+        .context("failed to read MCP response")?
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: serde_json::Value =
+            serde_json::from_str(&line).context("failed to parse MCP JSON-RPC message")?;
+        if !mcp_id_matches(&message, expected_id) {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            anyhow::bail!("MCP request {expected_id} failed: {}", compact_json(error));
+        }
+        return Ok(message
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null));
+    }
+
+    anyhow::bail!("MCP server closed stdout before response {expected_id}")
+}
+
+fn mcp_id_matches(message: &serde_json::Value, expected_id: u64) -> bool {
+    let Some(id) = message.get("id") else {
+        return false;
+    };
+    id.as_u64() == Some(expected_id)
+        || id
+            .as_str()
+            .is_some_and(|value| value == expected_id.to_string())
+}
+
+fn parse_mcp_tools_result(result: &serde_json::Value) -> Result<Vec<McpToolInfo>> {
+    let tools = result
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .context("MCP tools/list result did not contain a tools array")?;
+    tools
+        .iter()
+        .map(|tool| {
+            let name = tool
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .context("MCP tool is missing a string name")?
+                .to_string();
+            let description = tool
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let input_schema = tool
+                .get("inputSchema")
+                .or_else(|| tool.get("input_schema"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+            Ok(McpToolInfo {
+                name,
+                description,
+                input_schema,
+            })
+        })
+        .collect()
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
 pub fn config_to_toml(config: &AppConfig) -> Result<String> {
@@ -1052,6 +1510,26 @@ fn apply_env_overrides(config: &mut AppConfig) {
     {
         config.permission.mode = mode;
     }
+
+    if let Some(timeout_seconds) = env_u64("LUCKCODE_MODEL_TIMEOUT_SECONDS") {
+        for provider in config.providers.values_mut() {
+            provider.timeout_seconds = Some(timeout_seconds);
+        }
+    }
+
+    if let Some(retry_attempts) = env_u8("LUCKCODE_MODEL_RETRY_ATTEMPTS") {
+        for provider in config.providers.values_mut() {
+            provider.retry_attempts = Some(retry_attempts);
+        }
+    }
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    env::var(name).ok()?.parse().ok()
+}
+
+fn env_u8(name: &str) -> Option<u8> {
+    env::var(name).ok()?.parse().ok()
 }
 
 fn parse_permission_mode(value: &str) -> Result<PermissionMode> {
@@ -1145,6 +1623,8 @@ struct PartialProviderConfig {
     base_url: Option<String>,
     api_key_env: Option<String>,
     request_format: Option<String>,
+    timeout_seconds: Option<u64>,
+    retry_attempts: Option<u8>,
     enabled: Option<bool>,
 }
 
@@ -1164,6 +1644,12 @@ impl PartialProviderConfig {
         }
         if let Some(request_format) = self.request_format {
             config.request_format = Some(request_format);
+        }
+        if let Some(timeout_seconds) = self.timeout_seconds {
+            config.timeout_seconds = Some(timeout_seconds);
+        }
+        if let Some(retry_attempts) = self.retry_attempts {
+            config.retry_attempts = Some(retry_attempts);
         }
         if let Some(enabled) = self.enabled {
             config.enabled = enabled;
@@ -1292,6 +1778,8 @@ model = "gpt-4.1"
 request_format = "chat-completions"
 api_key_env = "OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
+timeout_seconds = 120
+retry_attempts = 2
 enabled = true
 
 [providers.responses]
@@ -1300,6 +1788,8 @@ model = "gpt-4.1"
 request_format = "responses"
 api_key_env = "OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
+timeout_seconds = 120
+retry_attempts = 2
 enabled = true
 
 [providers.anthropic]
@@ -1307,12 +1797,20 @@ kind = "anthropic"
 model = "claude-sonnet-4-5"
 api_key_env = "ANTHROPIC_API_KEY"
 base_url = "https://api.anthropic.com"
+timeout_seconds = 120
+retry_attempts = 2
 enabled = true
 
 [commands]
 test = "cargo test"
 check = "cargo check"
 lint = "cargo clippy"
+
+[commands.policy]
+# One of: allow, ask, deny. Hard-denied commands are still refused first.
+default_policy = "ask"
+allowlist = ["git status", "git diff"]
+denylist = []
 
 [permission]
 mode = "manual"
@@ -1377,6 +1875,7 @@ mod tests {
                 api_key_env: Some("LOCAL_LLM_API_KEY".to_string()),
                 request_format: Some("chat-completions".to_string()),
                 enabled: true,
+                ..ProviderConfig::default()
             },
         );
 
@@ -1391,6 +1890,55 @@ mod tests {
             Some("http://localhost:11434/v1")
         );
         assert_eq!(resolved.api_key_env.as_deref(), Some("LOCAL_LLM_API_KEY"));
+    }
+
+    #[test]
+    fn provider_http_options_merge_from_partial_config() {
+        let partial: PartialAppConfig = toml::from_str(
+            r#"
+            [providers.openai]
+            kind = "openai"
+            timeout_seconds = 30
+            retry_attempts = 4
+            "#,
+        )
+        .expect("parse partial config");
+        let mut config = AppConfig::default();
+
+        partial.apply_to(&mut config);
+        let resolved =
+            resolve_provider_config(&config, Some("openai"), None).expect("resolve provider");
+
+        assert_eq!(resolved.timeout_seconds, Some(30));
+        assert_eq!(resolved.retry_attempts, Some(4));
+    }
+
+    #[test]
+    fn command_policy_merges_from_config() {
+        let partial: PartialAppConfig = toml::from_str(
+            r#"
+            [commands]
+            test = "cargo test"
+
+            [commands.policy]
+            default_policy = "deny"
+            allowlist = ["cargo test"]
+            denylist = ["npm publish"]
+            "#,
+        )
+        .expect("parse partial config");
+        let mut config = AppConfig::default();
+
+        partial.apply_to(&mut config);
+        let commands = config.commands.expect("commands configured");
+
+        assert_eq!(commands.test.as_deref(), Some("cargo test"));
+        assert_eq!(
+            commands.policy.default_policy,
+            Some(luckcode_tools::CommandPolicy::Deny)
+        );
+        assert_eq!(commands.policy.allowlist, vec!["cargo test"]);
+        assert_eq!(commands.policy.denylist, vec!["npm publish"]);
     }
 
     #[test]
@@ -1449,6 +1997,28 @@ mod tests {
     }
 
     #[test]
+    fn project_context_includes_workspace_commands_and_source_overview() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write manifest");
+        fs::write(root.join("src/lib.rs"), "pub fn run() {}\n").expect("write source");
+        fs::write(root.join(".env"), "SECRET=hidden\n").expect("write sensitive file");
+
+        let context = build_project_context(root, 200_000).expect("build context");
+
+        assert!(context.contains("- Detected project types: Rust"));
+        assert!(context.contains("- Workspace top-level:"));
+        assert!(context.contains("- src/"));
+        assert!(context.contains("- Command hints:"));
+        assert!(context.contains("test: cargo test"));
+        assert!(context.contains("- Source overview:"));
+        assert!(context.contains("src/lib.rs"));
+        assert!(!context.contains(".env"));
+        assert!(!context.contains("SECRET=hidden"));
+    }
+
+    #[test]
     fn mcp_config_parses_servers_without_exposing_env_semantics() {
         let config: McpConfig = serde_json::from_str(
             r#"{
@@ -1470,5 +2040,37 @@ mod tests {
             server.env.get("API_KEY").map(String::as_str),
             Some("secret")
         );
+    }
+
+    #[test]
+    fn parses_mcp_tools_list_result() {
+        let result = serde_json::json!({
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": "Lookup a value",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "key": { "type": "string" }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let tools = parse_mcp_tools_result(&result).expect("parse tools");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "lookup");
+        assert_eq!(tools[0].description.as_deref(), Some("Lookup a value"));
+        assert_eq!(tools[0].input_schema["type"], "object");
+    }
+
+    #[test]
+    fn mcp_response_id_matches_numeric_and_string_ids() {
+        assert!(mcp_id_matches(&serde_json::json!({ "id": 2 }), 2));
+        assert!(mcp_id_matches(&serde_json::json!({ "id": "2" }), 2));
+        assert!(!mcp_id_matches(&serde_json::json!({ "id": 3 }), 2));
     }
 }

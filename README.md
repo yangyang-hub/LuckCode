@@ -1,6 +1,6 @@
 # LuckCode
 
-LuckCode 是一个用 Rust 编写的本地 CLI Coding Agent。项目当前处于早期实现阶段：已经完成 workspace 骨架、CLI 入口、项目初始化、配置加载、只读本地工具、基础 session JSONL、第一版 Agent Loop、带 diff 预览/用户确认/checkpoint 的文件编辑系统（`edit_file` / `write_file` + `restore`）、带命令权限策略/确认/超时/输出截断的 `run_shell`、第一版 resume / compact / project memory，以及基础 symbol index。
+LuckCode 是一个用 Rust 编写的本地 CLI Coding Agent。项目当前处于早期实现阶段：已经完成 workspace 骨架、CLI 入口、项目初始化、配置加载、只读本地工具、基础 session JSONL、第一版 Agent Loop、带 diff 预览/用户确认/checkpoint 的文件编辑系统（`edit_file` / `write_file` + `restore`）、带命令权限策略/确认/超时/输出截断的 `run_shell`、第一版 resume / compact / project memory、基础 symbol index、更完整的 system context、HTTP provider 超时/重试/错误展示，以及 stdio MCP tool discovery / tool call。
 
 目标不是做玩具 Demo，而是逐步实现一个类似 Claude Code / Codex 的本地编程 Agent：
 
@@ -30,18 +30,22 @@ luckcode --compact
 - `luckcode tools call list_symbols` / `luckcode symbols`：列出常见源码文件里的函数、类型和模块符号。
 - `luckcode tools call edit_file`：用精确字符串替换修改已有文件（修改前展示 diff 并询问确认）。
 - `luckcode tools call write_file`：创建新文件（不允许覆盖已有文件）。
-- `luckcode tools call run_shell`：在工作区根目录执行 shell 命令；默认先询问，硬拒绝危险命令，并带超时和输出截断。
+- `luckcode tools call run_shell`：在工作区根目录执行 shell 命令；支持命令 allowlist / denylist / 默认策略配置，硬拒绝危险命令，并带超时和输出截断。
 - `luckcode ask --provider mock`：使用 MockProvider 进行本地流式输出验证。
 - `luckcode ask --provider openai`：使用 OpenAI-compatible Chat Completions provider。
 - `luckcode ask --provider responses`：使用 OpenAI Responses API 请求格式。
 - `luckcode ask --provider anthropic`：使用 Anthropic Messages API 请求格式。
 - 普通 prompt 会进入 Agent Loop：`--plan` 模式只挂只读工具；其它模式下模型可调用 `edit_file` / `write_file` / `run_shell`。写文件前展示 diff、询问确认（`--accept-edits` 自动放行）并创建 checkpoint；shell 命令在 manual / accept-edits 下仍会询问，auto / dangerous 下会先展示命令再执行。
+- Agent Loop 的 system context 会注入 `AGENTS.md`、项目类型、重要文件、工作区顶层概览、命令提示、源码概览、Git status/diff stat 和 project memory。
+- HTTP provider 支持配置化 `timeout_seconds` / `retry_attempts`；非 2xx 错误会显示 HTTP 状态和截断后的响应体，超时、连接错误、429 和 5xx 会重试。
+- `run_shell` 的权限策略优先级为：硬拒绝清单 → 配置 denylist → 配置 allowlist → 配置 default_policy 或当前权限模式。默认 allowlist 允许 `git status` / `git diff`，其它普通命令在 manual / sandbox 下仍会询问。
 - `--sandbox` 是第一版权限策略 sandbox：禁用文件编辑，但允许 shell 命令在硬拒绝清单和用户确认后执行。它还不是 Docker / container 隔离。
 - `luckcode restore [CHECKPOINT_ID]`：把当前项目最近一次 session 的最新 checkpoint（或指定 checkpoint）回滚。
 - `luckcode --resume [SESSION_ID] ["继续任务"]`：查看或继续当前项目的 session。
 - `luckcode --compact`：为当前项目最新 session 生成 compact summary 并写回 JSONL。
 - `luckcode memory show` / `memory set` / `memory remove`：管理当前项目的持久记忆。
 - `luckcode mcp list` / `mcp show`：检查 `.luckcode/mcp.json` 中配置的 MCP servers（env 值会被隐藏）。
+- `luckcode mcp tools SERVER` / `mcp call SERVER TOOL JSON`：启动 stdio MCP server，列出工具或调用工具。
 - session JSONL 会记录 user、assistant、tool_call、tool_result、checkpoint 和 compact_summary。
 - `luckcode session list` / `session show` 可以浏览已有 session 和事件 timeline。
 
@@ -82,6 +86,8 @@ cargo run -p luckcode-cli -- memory show
 cargo run -p luckcode-cli -- memory set project.test_command "cargo test"
 cargo run -p luckcode-cli -- mcp list
 cargo run -p luckcode-cli -- mcp show local
+cargo run -p luckcode-cli -- mcp tools local
+cargo run -p luckcode-cli -- mcp call local lookup '{"key":"value"}'
 ```
 
 `ask --provider mock`、`ask --provider openai`、`ask --provider responses` 和 `ask --provider anthropic` 都会走 `ModelProvider` 流式输出；普通 prompt 会走 Agent Loop。`--plan` 只挂只读工具；`--sandbox` 禁止编辑但允许经确认的 shell；其它模式下工具集包含 `edit_file` / `write_file` / `run_shell`，写文件前会展示 diff、按权限模式询问确认并创建 checkpoint，shell 命令会经过 `CommandPolicy` / `PermissionEngine` 检查。Agent Loop 会在 system context 中注入 `AGENTS.md`、项目类型、关键 manifest / README 预览、Git status、diff stat 和 project memory；`--resume` 会额外注入上一轮 compact summary。
@@ -107,6 +113,8 @@ model = "gpt-4.1"
 request_format = "chat-completions"
 api_key_env = "OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
+timeout_seconds = 120
+retry_attempts = 2
 enabled = true
 
 [providers.responses]
@@ -115,6 +123,8 @@ model = "gpt-4.1"
 request_format = "responses"
 api_key_env = "OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
+timeout_seconds = 120
+retry_attempts = 2
 enabled = true
 
 [providers.anthropic]
@@ -122,7 +132,23 @@ kind = "anthropic"
 model = "claude-sonnet-4-5"
 api_key_env = "ANTHROPIC_API_KEY"
 base_url = "https://api.anthropic.com"
+timeout_seconds = 120
+retry_attempts = 2
 enabled = true
+```
+
+命令策略可在配置中调整：
+
+```toml
+[commands]
+test = "cargo test"
+check = "cargo check"
+lint = "cargo clippy"
+
+[commands.policy]
+default_policy = "ask"
+allowlist = ["git status", "git diff"]
+denylist = []
 ```
 
 选择 provider：
@@ -146,6 +172,8 @@ model = "anthropic/claude-sonnet-4-5"
 ```bash
 export LUCKCODE_PROVIDER=responses
 export LUCKCODE_MODEL=gpt-4.1
+export LUCKCODE_MODEL_TIMEOUT_SECONDS=120
+export LUCKCODE_MODEL_RETRY_ATTEMPTS=2
 ```
 
 使用 OpenAI-compatible Chat Completions provider：
@@ -248,11 +276,11 @@ AGENTS.md
 - 文件编辑流程为 read → 校验 → 展示 diff → 用户确认（或 `--accept-edits` 自动放行）→ 创建 checkpoint → 写入。
 - 编辑写入前会在 `~/.local/share/luckcode/checkpoints/<project_hash>/<session_id>/` 下创建 checkpoint，`luckcode restore` 可回滚。
 - 不读取 `.env`、私钥和凭据；敏感文件不参与编辑。
-- shell 命令必须经过权限系统；第一版里除 `git status` / `git diff` 外的 shell 命令默认先询问用户，并硬拒绝 `sudo`、`rm -rf`、`chmod -R 777`、`curl|sh`、`wget|bash`、`dd`、`mkfs`、`docker system prune`、`terraform apply/destroy`、`kubectl delete` 以及引用敏感路径的命令。
+- shell 命令必须经过权限系统；除 allowlist 命中的命令外，shell 命令默认先询问用户，并硬拒绝 `sudo`、`rm -rf`、`chmod -R 777`、`curl|sh`、`wget|bash`、`dd`、`mkfs`、`docker system prune`、`terraform apply/destroy`、`kubectl delete` 以及引用敏感路径的命令。
 
 ## 下一阶段
 
-1. 增加更完整的 context builder。
-2. 完善三种 HTTP provider 的错误展示、重试和超时控制。
-3. 扩展 `run_shell` 权限系统（命令 allowlist、可配置默认策略、sandbox）并完善测试失败后的自动重试。
+1. 完善测试失败后的自动重试策略。
+2. 将 MCP stdio tools 接入 Agent tool registry 和权限系统。
+3. 用 tree-sitter 增强 symbol index 与 function-level context。
 4. 接入 ratatui TUI，提供交互式 diff、tool call timeline 和 session browser。
