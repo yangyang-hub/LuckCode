@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt, fs,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -13,12 +13,13 @@ use std::{
     time::Duration,
 };
 use tokio::{process::Command as TokioCommand, time};
+use tree_sitter::{Language, Node, Parser};
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str;
 
     fn schema(&self) -> Value;
 
@@ -66,6 +67,25 @@ pub struct CommandPreview {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CommandExecutor {
+    #[default]
+    Local,
+    Docker {
+        image: String,
+        network_disabled: bool,
+    },
+}
+
+impl CommandExecutor {
+    fn label(&self) -> &str {
+        match self {
+            Self::Local => "local",
+            Self::Docker { .. } => "docker",
+        }
+    }
+}
+
 pub type ConfirmEdit = Arc<dyn Fn(&EditPreview) -> bool + Send + Sync>;
 pub type ConfirmCommand = Arc<dyn Fn(&CommandPreview) -> bool + Send + Sync>;
 pub type AnnounceCommand = Arc<dyn Fn(&CommandPreview) + Send + Sync>;
@@ -78,6 +98,7 @@ pub struct ToolContext {
     pub edit_approval: EditApproval,
     pub command_approval: CommandApproval,
     pub command_policy: CommandPolicyConfig,
+    pub command_executor: CommandExecutor,
     pub confirm_edit: Option<ConfirmEdit>,
     pub confirm_command: Option<ConfirmCommand>,
     pub announce_command: Option<AnnounceCommand>,
@@ -92,6 +113,7 @@ impl fmt::Debug for ToolContext {
             .field("edit_approval", &self.edit_approval)
             .field("command_approval", &self.command_approval)
             .field("command_policy", &self.command_policy)
+            .field("command_executor", &self.command_executor)
             .field("confirm_edit", &self.confirm_edit.is_some())
             .field("confirm_command", &self.confirm_command.is_some())
             .field("announce_command", &self.announce_command.is_some())
@@ -108,6 +130,7 @@ impl ToolContext {
             edit_approval: EditApproval::Refuse,
             command_approval: CommandApproval::Refuse,
             command_policy: CommandPolicyConfig::default(),
+            command_executor: CommandExecutor::Local,
             confirm_edit: None,
             confirm_command: None,
             announce_command: None,
@@ -127,6 +150,11 @@ impl ToolContext {
 
     pub fn with_command_policy(mut self, policy: CommandPolicyConfig) -> Self {
         self.command_policy = policy;
+        self
+    }
+
+    pub fn with_command_executor(mut self, executor: CommandExecutor) -> Self {
+        self.command_executor = executor;
         self
     }
 
@@ -166,8 +194,8 @@ pub struct ToolOutput {
 
 #[derive(Debug, Clone)]
 pub struct ToolInfo {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub schema: Value,
 }
 
@@ -190,12 +218,12 @@ impl ToolRegistry {
             .tools
             .values()
             .map(|tool| ToolInfo {
-                name: tool.name(),
-                description: tool.description(),
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
                 schema: tool.schema(),
             })
             .collect::<Vec<_>>();
-        tools.sort_by_key(|tool| tool.name);
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools
     }
 
@@ -217,6 +245,9 @@ fn register_readonly(registry: &mut ToolRegistry) {
     registry.register(GitStatusTool);
     registry.register(GitDiffTool);
     registry.register(ListSymbolsTool);
+    registry.register(FindSymbolTool);
+    registry.register(FindReferencesTool);
+    registry.register(ModuleSummaryTool);
 }
 
 fn register_mutating(registry: &mut ToolRegistry) {
@@ -251,11 +282,11 @@ pub struct ListFilesTool;
 
 #[async_trait]
 impl Tool for ListFilesTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "list_files"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "List files under a workspace-relative path."
     }
 
@@ -335,11 +366,11 @@ pub struct ReadFileTool;
 
 #[async_trait]
 impl Tool for ReadFileTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "read_file"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Read a UTF-8 text file from the workspace."
     }
 
@@ -416,11 +447,11 @@ pub struct SearchFilesTool;
 
 #[async_trait]
 impl Tool for SearchFilesTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "search_files"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Search workspace text files with a plain substring query."
     }
 
@@ -514,11 +545,11 @@ pub struct DetectProjectTool;
 
 #[async_trait]
 impl Tool for DetectProjectTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "detect_project"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Detect project languages, manifests, and common project files."
     }
 
@@ -597,11 +628,11 @@ pub struct GitStatusTool;
 
 #[async_trait]
 impl Tool for GitStatusTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "git_status"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Show git status for the workspace."
     }
 
@@ -636,11 +667,11 @@ pub struct GitDiffTool;
 
 #[async_trait]
 impl Tool for GitDiffTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "git_diff"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Show git diff for the workspace."
     }
 
@@ -675,11 +706,11 @@ pub struct ListSymbolsTool;
 
 #[async_trait]
 impl Tool for ListSymbolsTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "list_symbols"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "List function and type symbols from common source files in the workspace."
     }
 
@@ -746,10 +777,318 @@ struct ListSymbolsInput {
     limit: Option<usize>,
 }
 
+pub struct FindSymbolTool;
+
+#[async_trait]
+impl Tool for FindSymbolTool {
+    fn name(&self) -> &str {
+        "find_symbol"
+    }
+
+    fn description(&self) -> &str {
+        "Find a symbol and return function-level source context."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string", "description": "Symbol name to find. Qualified names match their final segment." },
+                "path": { "type": "string", "default": "." },
+                "context_lines": { "type": "integer", "minimum": 0, "default": 2 },
+                "limit": { "type": "integer", "minimum": 1, "default": 20 }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        let input: FindSymbolInput =
+            serde_json::from_value(input).context("invalid find_symbol input")?;
+        let query = input.name.trim();
+        if query.is_empty() {
+            anyhow::bail!("name must not be empty");
+        }
+
+        let target = resolve_existing_path(&ctx, input.path.as_deref().unwrap_or("."))?;
+        let root = canonical_workspace_root(&ctx)?;
+        let limit = input.limit.unwrap_or(20);
+        let context_lines = input.context_lines.unwrap_or(2);
+        let search = SymbolSearch {
+            query,
+            context_lines,
+            limit,
+        };
+        let mut matches = Vec::new();
+        let mut truncated = false;
+
+        if target.is_file() {
+            collect_symbol_matches_from_file(
+                &target,
+                &root,
+                &ctx,
+                &search,
+                &mut matches,
+                &mut truncated,
+            )?;
+        } else if target.is_dir() {
+            let mut builder = WalkBuilder::new(&target);
+            builder
+                .hidden(false)
+                .parents(true)
+                .git_ignore(true)
+                .git_exclude(true);
+
+            for result in builder.build() {
+                let entry = result.context("failed to walk files")?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                collect_symbol_matches_from_file(
+                    path,
+                    &root,
+                    &ctx,
+                    &search,
+                    &mut matches,
+                    &mut truncated,
+                )?;
+                if truncated {
+                    break;
+                }
+            }
+        } else {
+            anyhow::bail!("{} is not a file or directory", target.display());
+        }
+
+        let content = if matches.is_empty() {
+            format!("No symbol found for '{query}'.\n")
+        } else {
+            matches.join("\n\n")
+        };
+        Ok(ToolOutput {
+            content,
+            metadata: json!({ "query": query, "count": matches.len() }),
+            truncated,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FindSymbolInput {
+    name: String,
+    path: Option<String>,
+    context_lines: Option<usize>,
+    limit: Option<usize>,
+}
+
+pub struct FindReferencesTool;
+
+#[async_trait]
+impl Tool for FindReferencesTool {
+    fn name(&self) -> &str {
+        "find_references"
+    }
+
+    fn description(&self) -> &str {
+        "Find identifier references to a symbol in supported source files."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string", "description": "Symbol name to search for. Qualified names use their final segment." },
+                "path": { "type": "string", "default": "." },
+                "context_lines": { "type": "integer", "minimum": 0, "default": 1 },
+                "limit": { "type": "integer", "minimum": 1, "default": 100 }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        let input: FindReferencesInput =
+            serde_json::from_value(input).context("invalid find_references input")?;
+        let query = input.name.trim();
+        if query.is_empty() {
+            anyhow::bail!("name must not be empty");
+        }
+
+        let reference_name = symbol_query_leaf(query).to_string();
+        let target = resolve_existing_path(&ctx, input.path.as_deref().unwrap_or("."))?;
+        let root = canonical_workspace_root(&ctx)?;
+        let search = ReferenceSearch {
+            query: &reference_name,
+            context_lines: input.context_lines.unwrap_or(1),
+            limit: input.limit.unwrap_or(100),
+        };
+        let mut matches = Vec::new();
+        let mut truncated = false;
+
+        if target.is_file() {
+            collect_reference_matches_from_file(
+                &target,
+                &root,
+                &ctx,
+                &search,
+                &mut matches,
+                &mut truncated,
+            )?;
+        } else if target.is_dir() {
+            let mut builder = WalkBuilder::new(&target);
+            builder
+                .hidden(false)
+                .parents(true)
+                .git_ignore(true)
+                .git_exclude(true);
+
+            for result in builder.build() {
+                let entry = result.context("failed to walk files")?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                collect_reference_matches_from_file(
+                    path,
+                    &root,
+                    &ctx,
+                    &search,
+                    &mut matches,
+                    &mut truncated,
+                )?;
+                if truncated {
+                    break;
+                }
+            }
+        } else {
+            anyhow::bail!("{} is not a file or directory", target.display());
+        }
+
+        let content = if matches.is_empty() {
+            format!("No references found for '{query}'.\n")
+        } else {
+            matches.join("\n\n")
+        };
+
+        Ok(ToolOutput {
+            content,
+            metadata: json!({
+                "query": query,
+                "reference_name": reference_name,
+                "count": matches.len(),
+            }),
+            truncated,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FindReferencesInput {
+    name: String,
+    path: Option<String>,
+    context_lines: Option<usize>,
+    limit: Option<usize>,
+}
+
+pub struct ModuleSummaryTool;
+
+#[async_trait]
+impl Tool for ModuleSummaryTool {
+    fn name(&self) -> &str {
+        "module_summary"
+    }
+
+    fn description(&self) -> &str {
+        "Summarize modules, types, functions, and methods by source file."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "default": "." },
+                "limit": { "type": "integer", "minimum": 1, "default": 200 }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        let input: ModuleSummaryInput =
+            serde_json::from_value(input).context("invalid module_summary input")?;
+        let target = resolve_existing_path(&ctx, input.path.as_deref().unwrap_or("."))?;
+        let root = canonical_workspace_root(&ctx)?;
+        let limit = input.limit.unwrap_or(200);
+        let mut records = Vec::new();
+        let mut truncated = false;
+
+        if target.is_file() {
+            collect_symbols_from_file(&target, &root, &ctx, limit, &mut records, &mut truncated)?;
+        } else if target.is_dir() {
+            let mut builder = WalkBuilder::new(&target);
+            builder
+                .hidden(false)
+                .parents(true)
+                .git_ignore(true)
+                .git_exclude(true);
+
+            for result in builder.build() {
+                let entry = result.context("failed to walk files")?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                collect_symbols_from_file(path, &root, &ctx, limit, &mut records, &mut truncated)?;
+                if truncated {
+                    break;
+                }
+            }
+        } else {
+            anyhow::bail!("{} is not a file or directory", target.display());
+        }
+
+        let file_count = records
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let content = render_module_summary(&records);
+        Ok(ToolOutput {
+            content,
+            metadata: json!({
+                "file_count": file_count,
+                "symbol_count": records.len(),
+            }),
+            truncated,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModuleSummaryInput {
+    path: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SymbolSearch<'a> {
+    query: &'a str,
+    context_lines: usize,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReferenceSearch<'a> {
+    query: &'a str,
+    context_lines: usize,
+    limit: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SymbolRecord {
     path: String,
     line: usize,
+    end_line: usize,
     kind: String,
     name: String,
 }
@@ -758,6 +1097,115 @@ impl SymbolRecord {
     fn display(&self) -> String {
         format!("{}:{}:{} {}", self.path, self.line, self.kind, self.name)
     }
+}
+
+fn collect_symbol_matches_from_file(
+    path: &Path,
+    root: &Path,
+    ctx: &ToolContext,
+    search: &SymbolSearch<'_>,
+    matches: &mut Vec<String>,
+    truncated: &mut bool,
+) -> Result<()> {
+    if matches.len() >= search.limit {
+        *truncated = true;
+        return Ok(());
+    }
+    if !is_supported_symbol_file(path) || is_sensitive_path(path) {
+        return Ok(());
+    }
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(()),
+    };
+    if metadata.len() > ctx.max_file_size {
+        return Ok(());
+    }
+
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    let lines = text.lines().collect::<Vec<_>>();
+    for mut record in extract_symbols(path, &text) {
+        if matches.len() >= search.limit {
+            *truncated = true;
+            break;
+        }
+        if !symbol_name_matches(search.query, &record.name) {
+            continue;
+        }
+        record.path = rel.clone();
+        matches.push(render_symbol_context(&record, &lines, search.context_lines));
+    }
+    Ok(())
+}
+
+fn collect_reference_matches_from_file(
+    path: &Path,
+    root: &Path,
+    ctx: &ToolContext,
+    search: &ReferenceSearch<'_>,
+    matches: &mut Vec<String>,
+    truncated: &mut bool,
+) -> Result<()> {
+    if matches.len() >= search.limit {
+        *truncated = true;
+        return Ok(());
+    }
+    if !is_supported_symbol_file(path) || is_sensitive_path(path) {
+        return Ok(());
+    }
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(()),
+    };
+    if metadata.len() > ctx.max_file_size {
+        return Ok(());
+    }
+
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    let lines = text.lines().collect::<Vec<_>>();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if matches.len() >= search.limit {
+            *truncated = true;
+            break;
+        }
+        if is_comment_only_line(line) {
+            continue;
+        }
+
+        for column in reference_columns(line, search.query) {
+            if matches.len() >= search.limit {
+                *truncated = true;
+                break;
+            }
+            matches.push(render_reference_context(
+                &rel,
+                idx + 1,
+                column,
+                search.query,
+                &lines,
+                search.context_lines,
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn collect_symbols_from_file(
@@ -812,17 +1260,390 @@ fn is_supported_symbol_file(path: &Path) -> bool {
 
 fn extract_symbols(path: &Path, text: &str) -> Vec<SymbolRecord> {
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    text.lines()
+    if let Some(records) = extract_tree_sitter_symbols(extension, text) {
+        return records;
+    }
+
+    extract_symbols_from_lines(extension, text)
+}
+
+fn extract_symbols_from_lines(extension: &str, text: &str) -> Vec<SymbolRecord> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut records = lines
+        .iter()
         .enumerate()
         .filter_map(|(idx, line)| {
             extract_symbol_from_line(extension, line).map(|(kind, name)| SymbolRecord {
                 path: String::new(),
                 line: idx + 1,
+                end_line: idx + 1,
                 kind,
                 name,
             })
         })
+        .collect::<Vec<_>>();
+
+    for idx in 0..records.len() {
+        let next_start = records.get(idx + 1).map(|record| record.line);
+        records[idx].end_line =
+            infer_symbol_end_line(extension, &lines, records[idx].line, next_start);
+    }
+
+    records
+}
+
+fn extract_tree_sitter_symbols(extension: &str, text: &str) -> Option<Vec<SymbolRecord>> {
+    let language = tree_sitter_language(extension)?;
+    let mut parser = Parser::new();
+    parser.set_language(&language).ok()?;
+    let tree = parser.parse(text, None)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+
+    let mut records = Vec::new();
+    collect_tree_sitter_symbols(extension, root, text, &mut records);
+    Some(records)
+}
+
+fn tree_sitter_language(extension: &str) -> Option<Language> {
+    match extension {
+        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        "java" => Some(tree_sitter_java::LANGUAGE.into()),
+        _ => None,
+    }
+}
+
+fn collect_tree_sitter_symbols(
+    extension: &str,
+    node: Node<'_>,
+    text: &str,
+    records: &mut Vec<SymbolRecord>,
+) {
+    if let Some(record) = tree_sitter_symbol_from_node(extension, node, text) {
+        records.push(record);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_tree_sitter_symbols(extension, child, text, records);
+    }
+}
+
+fn tree_sitter_symbol_from_node(
+    extension: &str,
+    node: Node<'_>,
+    text: &str,
+) -> Option<SymbolRecord> {
+    match extension {
+        "rs" => rust_tree_sitter_symbol(node, text),
+        "ts" | "tsx" => typescript_tree_sitter_symbol(node, text),
+        "java" => java_tree_sitter_symbol(node, text),
+        _ => None,
+    }
+}
+
+fn rust_tree_sitter_symbol(node: Node<'_>, text: &str) -> Option<SymbolRecord> {
+    let (kind, name) = match node.kind() {
+        "function_item" => ("function", name_from_field(node, "name", text)?),
+        "struct_item" => ("struct", name_from_field(node, "name", text)?),
+        "enum_item" => ("enum", name_from_field(node, "name", text)?),
+        "trait_item" => ("trait", name_from_field(node, "name", text)?),
+        "mod_item" => ("module", name_from_field(node, "name", text)?),
+        "impl_item" => ("impl", type_name_from_field(node, "type", text)?),
+        _ => return None,
+    };
+
+    Some(tree_sitter_record(node, kind, name))
+}
+
+fn typescript_tree_sitter_symbol(node: Node<'_>, text: &str) -> Option<SymbolRecord> {
+    let (kind, name) = match node.kind() {
+        "function_declaration" => ("function", name_from_field(node, "name", text)?),
+        "class_declaration" => ("class", name_from_field(node, "name", text)?),
+        "interface_declaration" => ("interface", name_from_field(node, "name", text)?),
+        "enum_declaration" => ("enum", name_from_field(node, "name", text)?),
+        "type_alias_declaration" => ("type", name_from_field(node, "name", text)?),
+        "method_definition" => ("method", name_from_field(node, "name", text)?),
+        "variable_declarator" if is_function_like_declarator(node) => {
+            ("function", name_from_field(node, "name", text)?)
+        }
+        _ => return None,
+    };
+
+    Some(tree_sitter_record(node, kind, name))
+}
+
+fn java_tree_sitter_symbol(node: Node<'_>, text: &str) -> Option<SymbolRecord> {
+    let (kind, name) = match node.kind() {
+        "class_declaration" => ("class", name_from_field(node, "name", text)?),
+        "interface_declaration" => ("interface", name_from_field(node, "name", text)?),
+        "enum_declaration" => ("enum", name_from_field(node, "name", text)?),
+        "method_declaration" => ("method", name_from_field(node, "name", text)?),
+        _ => return None,
+    };
+
+    Some(tree_sitter_record(node, kind, name))
+}
+
+fn is_function_like_declarator(node: Node<'_>) -> bool {
+    let Some(value) = node.child_by_field_name("value") else {
+        return false;
+    };
+
+    matches!(value.kind(), "arrow_function" | "function_expression")
+}
+
+fn tree_sitter_record(node: Node<'_>, kind: &str, name: String) -> SymbolRecord {
+    SymbolRecord {
+        path: String::new(),
+        line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        kind: kind.to_string(),
+        name,
+    }
+}
+
+fn name_from_field(node: Node<'_>, field: &str, text: &str) -> Option<String> {
+    let name = node.child_by_field_name(field)?;
+    clean_symbol_name(node_text(name, text)?)
+}
+
+fn type_name_from_field(node: Node<'_>, field: &str, text: &str) -> Option<String> {
+    let name = node.child_by_field_name(field)?;
+    clean_type_symbol_name(node_text(name, text)?)
+}
+
+fn node_text<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
+    node.utf8_text(text.as_bytes()).ok()
+}
+
+fn clean_symbol_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    leading_identifier(trimmed)
+        .map(ToOwned::to_owned)
+        .or_else(|| identifier_tokens(trimmed).first().cloned())
+}
+
+fn clean_type_symbol_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let without_generics = trimmed.split(['<', '(']).next().unwrap_or(trimmed).trim();
+    let tail = without_generics
+        .rsplit("::")
+        .next()
+        .unwrap_or(without_generics)
+        .trim();
+
+    leading_identifier(tail)
+        .map(ToOwned::to_owned)
+        .or_else(|| identifier_tokens(tail).last().cloned())
+}
+
+fn infer_symbol_end_line(
+    extension: &str,
+    lines: &[&str],
+    start_line: usize,
+    next_start: Option<usize>,
+) -> usize {
+    let fallback = next_start
+        .map(|line| line.saturating_sub(1))
+        .unwrap_or(lines.len())
+        .max(start_line);
+    match extension {
+        "py" => infer_indent_block_end(lines, start_line, fallback),
+        "rs" | "ts" | "tsx" | "js" | "jsx" | "go" | "java" => {
+            infer_brace_block_end(lines, start_line).unwrap_or(fallback)
+        }
+        _ => fallback,
+    }
+}
+
+fn infer_indent_block_end(lines: &[&str], start_line: usize, fallback: usize) -> usize {
+    let Some(start) = lines.get(start_line.saturating_sub(1)) else {
+        return fallback;
+    };
+    let start_indent = leading_whitespace_count(start);
+    let mut end_line = start_line;
+    for (idx, line) in lines.iter().enumerate().skip(start_line) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            end_line = idx + 1;
+            continue;
+        }
+        if leading_whitespace_count(line) <= start_indent {
+            break;
+        }
+        end_line = idx + 1;
+    }
+    end_line.max(start_line).min(fallback)
+}
+
+fn infer_brace_block_end(lines: &[&str], start_line: usize) -> Option<usize> {
+    let mut depth: i64 = 0;
+    let mut saw_open = false;
+    for (idx, line) in lines.iter().enumerate().skip(start_line.saturating_sub(1)) {
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    saw_open = true;
+                }
+                '}' if saw_open => {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return Some(idx + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !saw_open && line.trim_end().ends_with(';') {
+            return Some(idx + 1);
+        }
+    }
+    None
+}
+
+fn render_symbol_context(record: &SymbolRecord, lines: &[&str], context_lines: usize) -> String {
+    let start = record.line.saturating_sub(context_lines).max(1);
+    let end = (record.end_line + context_lines)
+        .min(lines.len())
+        .max(record.line);
+    let mut out = format!(
+        "{}:{}-{}:{} {}\n",
+        record.path, record.line, record.end_line, record.kind, record.name
+    );
+    for line_number in start..=end {
+        let Some(line) = lines.get(line_number - 1) else {
+            continue;
+        };
+        out.push_str(&format!("{line_number:>4} | {line}\n"));
+    }
+    out
+}
+
+fn render_reference_context(
+    path: &str,
+    line: usize,
+    column: usize,
+    name: &str,
+    lines: &[&str],
+    context_lines: usize,
+) -> String {
+    let start = line.saturating_sub(context_lines).max(1);
+    let end = (line + context_lines).min(lines.len()).max(line);
+    let mut out = format!("{path}:{line}:{column}:reference {name}\n");
+    for line_number in start..=end {
+        let Some(text) = lines.get(line_number - 1) else {
+            continue;
+        };
+        out.push_str(&format!("{line_number:>4} | {text}\n"));
+    }
+    out
+}
+
+fn render_module_summary(records: &[SymbolRecord]) -> String {
+    if records.is_empty() {
+        return "No symbols found.\n".to_string();
+    }
+
+    let mut by_file: BTreeMap<&str, Vec<&SymbolRecord>> = BTreeMap::new();
+    for record in records {
+        by_file
+            .entry(record.path.as_str())
+            .or_default()
+            .push(record);
+    }
+
+    let mut out = String::new();
+    for (path, file_records) in by_file {
+        out.push_str(path);
+        out.push('\n');
+
+        let mut buckets: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for record in file_records {
+            buckets
+                .entry(summary_bucket(&record.kind))
+                .or_default()
+                .push(format!("{}@{}", record.name, line_range(record)));
+        }
+
+        for label in ["modules", "types", "impls", "functions", "methods", "other"] {
+            let Some(values) = buckets.get(label) else {
+                continue;
+            };
+            out.push_str("  ");
+            out.push_str(label);
+            out.push_str(": ");
+            out.push_str(&values.join(", "));
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn summary_bucket(kind: &str) -> &'static str {
+    match kind {
+        "module" => "modules",
+        "struct" | "enum" | "trait" | "class" | "interface" | "type" => "types",
+        "impl" => "impls",
+        "function" => "functions",
+        "method" => "methods",
+        _ => "other",
+    }
+}
+
+fn line_range(record: &SymbolRecord) -> String {
+    if record.end_line > record.line {
+        format!("{}-{}", record.line, record.end_line)
+    } else {
+        record.line.to_string()
+    }
+}
+
+fn symbol_name_matches(query: &str, name: &str) -> bool {
+    name == query || symbol_query_leaf(query) == name
+}
+
+fn symbol_query_leaf(query: &str) -> &str {
+    query
+        .rsplit(['.', ':'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(query)
+}
+
+fn leading_whitespace_count(line: &str) -> usize {
+    line.chars().take_while(|ch| ch.is_whitespace()).count()
+}
+
+fn reference_columns(line: &str, name: &str) -> Vec<usize> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+
+    line.match_indices(name)
+        .filter(|(idx, _)| is_identifier_boundary(line, *idx, name.len()))
+        .map(|(idx, _)| line[..idx].chars().count() + 1)
         .collect()
+}
+
+fn is_identifier_boundary(line: &str, start: usize, len: usize) -> bool {
+    let before = line[..start].chars().next_back();
+    let after = line[start + len..].chars().next();
+    !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn is_comment_only_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*')
 }
 
 fn extract_symbol_from_line(extension: &str, line: &str) -> Option<(String, String)> {
@@ -1047,11 +1868,11 @@ pub struct RunShellTool;
 
 #[async_trait]
 impl Tool for RunShellTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "run_shell"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Run a shell command in the workspace with permission checks, timeout, and output truncation."
     }
 
@@ -1104,7 +1925,7 @@ impl Tool for RunShellTool {
                 if !prompted {
                     announce_command(&ctx, &preview);
                 }
-                run_shell_command(&preview).await
+                run_shell_command(&preview, &ctx.command_executor).await
             }
         }
     }
@@ -1186,9 +2007,11 @@ fn announce_command(ctx: &ToolContext, preview: &CommandPreview) {
     }
 }
 
-async fn run_shell_command(preview: &CommandPreview) -> Result<ToolOutput> {
-    let mut command = shell_command(&preview.command);
-    command.current_dir(&preview.working_dir);
+async fn run_shell_command(
+    preview: &CommandPreview,
+    executor: &CommandExecutor,
+) -> Result<ToolOutput> {
+    let mut command = command_for_executor(preview, executor)?;
     command.kill_on_drop(true);
 
     let output = match time::timeout(
@@ -1206,6 +2029,7 @@ async fn run_shell_command(preview: &CommandPreview) -> Result<ToolOutput> {
                 ),
                 metadata: json!({
                     "command": preview.command,
+                    "executor": executor.label(),
                     "timeout_seconds": preview.timeout_seconds,
                     "timed_out": true,
                 }),
@@ -1229,6 +2053,7 @@ async fn run_shell_command(preview: &CommandPreview) -> Result<ToolOutput> {
 
     let mut content = String::new();
     content.push_str(&format!("command: {}\n", preview.command));
+    content.push_str(&format!("executor: {}\n", executor.label()));
     content.push_str(&format!("exit_code: {exit_code_text}\n"));
     content.push_str("stdout:\n");
     content.push_str(&stdout);
@@ -1245,6 +2070,8 @@ async fn run_shell_command(preview: &CommandPreview) -> Result<ToolOutput> {
         content,
         metadata: json!({
             "command": preview.command,
+            "executor": executor.label(),
+            "sandboxed": matches!(executor, CommandExecutor::Docker { .. }),
             "exit_code": exit_code,
             "success": output.status.success(),
             "timeout_seconds": preview.timeout_seconds,
@@ -1253,6 +2080,51 @@ async fn run_shell_command(preview: &CommandPreview) -> Result<ToolOutput> {
         }),
         truncated: stdout_truncated || stderr_truncated,
     })
+}
+
+fn command_for_executor(
+    preview: &CommandPreview,
+    executor: &CommandExecutor,
+) -> Result<TokioCommand> {
+    match executor {
+        CommandExecutor::Local => {
+            let mut command = shell_command(&preview.command);
+            command.current_dir(&preview.working_dir);
+            Ok(command)
+        }
+        CommandExecutor::Docker {
+            image,
+            network_disabled,
+        } => {
+            if image.trim().is_empty() {
+                anyhow::bail!("docker sandbox image must not be empty");
+            }
+            let mut command = TokioCommand::new("docker");
+            command.args(docker_command_args(preview, image, *network_disabled));
+            Ok(command)
+        }
+    }
+}
+
+fn docker_command_args(
+    preview: &CommandPreview,
+    image: &str,
+    network_disabled: bool,
+) -> Vec<String> {
+    let mut args = vec!["run".to_string(), "--rm".to_string()];
+    if network_disabled {
+        args.push("--network".to_string());
+        args.push("none".to_string());
+    }
+    args.push("-v".to_string());
+    args.push(format!("{}:/workspace", preview.working_dir.display()));
+    args.push("-w".to_string());
+    args.push("/workspace".to_string());
+    args.push(image.to_string());
+    args.push("sh".to_string());
+    args.push("-lc".to_string());
+    args.push(preview.command.clone());
+    args
 }
 
 #[cfg(windows)]
@@ -1420,11 +2292,11 @@ pub struct EditFileTool;
 
 #[async_trait]
 impl Tool for EditFileTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "edit_file"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Replace an exact substring in an existing workspace file with a new substring."
     }
 
@@ -1548,11 +2420,11 @@ pub struct WriteFileTool;
 
 #[async_trait]
 impl Tool for WriteFileTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "write_file"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Create a new UTF-8 text file in the workspace. Existing files cannot be overwritten."
     }
 
@@ -2111,6 +2983,219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_symbol_returns_function_level_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_file(
+            &root,
+            "src/lib.rs",
+            "pub fn helper() {}\n\npub fn run() {\n    helper();\n}\n\npub struct App;\n",
+        )
+        .await;
+
+        let output = FindSymbolTool
+            .execute(
+                json!({ "name": "crate::run", "path": "src/lib.rs", "context_lines": 1 }),
+                ToolContext::new(&root, MAX_FILE_SIZE),
+            )
+            .await
+            .unwrap();
+
+        assert!(output.content.contains("src/lib.rs:3-5:function run"));
+        assert!(output.content.contains("   3 | pub fn run() {"));
+        assert!(output.content.contains("   4 |     helper();"));
+        assert_eq!(output.metadata["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn find_references_returns_identifier_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_file(
+            &root,
+            "src/lib.rs",
+            "pub fn run() {}\npub fn runner() {}\n\nfn main() {\n    run();\n}\n",
+        )
+        .await;
+
+        let output = FindReferencesTool
+            .execute(
+                json!({ "name": "crate::run", "path": "src/lib.rs", "context_lines": 0 }),
+                ToolContext::new(&root, MAX_FILE_SIZE),
+            )
+            .await
+            .unwrap();
+
+        assert!(output.content.contains("src/lib.rs:1:8:reference run"));
+        assert!(output.content.contains("src/lib.rs:5:5:reference run"));
+        assert!(!output.content.contains("src/lib.rs:2:"));
+        assert_eq!(output.metadata["reference_name"], "run");
+    }
+
+    #[tokio::test]
+    async fn module_summary_groups_symbols_by_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_file(&root, "src/lib.rs", "pub struct App;\npub fn run() {}\n").await;
+        write_file(
+            &root,
+            "src/auth.ts",
+            "export interface User { id: string }\n",
+        )
+        .await;
+
+        let output = ModuleSummaryTool
+            .execute(
+                json!({ "path": "src", "limit": 20 }),
+                ToolContext::new(&root, MAX_FILE_SIZE),
+            )
+            .await
+            .unwrap();
+
+        assert!(output.content.contains("src/auth.ts\n"));
+        assert!(output.content.contains("  types: User@1"));
+        assert!(output.content.contains("src/lib.rs\n"));
+        assert!(output.content.contains("  types: App@1"));
+        assert!(output.content.contains("  functions: run@2"));
+        assert_eq!(output.metadata["file_count"], 2);
+        assert_eq!(output.metadata["symbol_count"], 3);
+    }
+
+    #[test]
+    fn tree_sitter_extracts_rust_symbols_with_precise_ranges() {
+        let text = "\
+pub mod service {
+    pub struct App;
+
+    impl App {
+        pub async fn run(&self) {
+            helper();
+        }
+    }
+
+    pub trait Runner {
+        fn start(&self);
+    }
+
+    fn helper() {}
+}
+";
+
+        let records = extract_symbols(Path::new("src/lib.rs"), text);
+
+        assert!(records.iter().any(|record| {
+            record.kind == "module" && record.name == "service" && record.line == 1
+        }));
+        assert!(
+            records.iter().any(|record| {
+                record.kind == "struct" && record.name == "App" && record.line == 2
+            })
+        );
+        assert!(
+            records.iter().any(|record| {
+                record.kind == "impl" && record.name == "App" && record.line == 4
+            })
+        );
+        assert!(records.iter().any(|record| {
+            record.kind == "function"
+                && record.name == "run"
+                && record.line == 5
+                && record.end_line == 7
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == "trait" && record.name == "Runner" && record.line == 10
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == "function" && record.name == "helper" && record.line == 14
+        }));
+    }
+
+    #[test]
+    fn tree_sitter_extracts_typescript_symbols_and_arrow_functions() {
+        let text = "\
+export interface User { id: string }
+type Loader = () => Promise<User>;
+export class AuthService {
+    login() {
+        return true;
+    }
+}
+export function createService() {
+    return new AuthService();
+}
+const buildToken = (user: User) => {
+    return user.id;
+};
+";
+
+        let records = extract_symbols(Path::new("src/auth.ts"), text);
+
+        assert!(records.iter().any(|record| {
+            record.kind == "interface" && record.name == "User" && record.line == 1
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == "type" && record.name == "Loader" && record.line == 2
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == "class" && record.name == "AuthService" && record.line == 3
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == "method"
+                && record.name == "login"
+                && record.line == 4
+                && record.end_line == 6
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == "function"
+                && record.name == "createService"
+                && record.line == 8
+                && record.end_line == 10
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == "function"
+                && record.name == "buildToken"
+                && record.line == 11
+                && record.end_line == 13
+        }));
+    }
+
+    #[test]
+    fn tree_sitter_extracts_java_types_and_methods() {
+        let text = "\
+public class AuthService {
+    public boolean login() {
+        return true;
+    }
+}
+interface Runner { void run(); }
+enum Status { OK }
+";
+
+        let records = extract_symbols(Path::new("src/AuthService.java"), text);
+
+        assert!(records.iter().any(|record| {
+            record.kind == "class" && record.name == "AuthService" && record.line == 1
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == "method"
+                && record.name == "login"
+                && record.line == 2
+                && record.end_line == 4
+        }));
+        assert!(records.iter().any(|record| {
+            record.kind == "interface" && record.name == "Runner" && record.line == 6
+        }));
+        assert!(
+            records.iter().any(|record| {
+                record.kind == "method" && record.name == "run" && record.line == 6
+            })
+        );
+        assert!(records.iter().any(|record| {
+            record.kind == "enum" && record.name == "Status" && record.line == 7
+        }));
+    }
+
+    #[tokio::test]
     async fn edit_file_rejects_path_outside_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -2235,5 +3320,38 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{err:#}").contains("sudo is not allowed"));
+    }
+
+    #[test]
+    fn docker_command_args_mount_workspace_without_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let preview = CommandPreview {
+            command: "cargo test".to_string(),
+            working_dir: root.clone(),
+            timeout_seconds: 120,
+            max_output_bytes: 20_000,
+            reason: "test".to_string(),
+        };
+
+        let args = docker_command_args(&preview, "rust:1.93", true);
+
+        assert_eq!(args[0], "run");
+        assert!(args.iter().any(|arg| arg == "--rm"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--network" && pair[1] == "none")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-w" && pair[1] == "/workspace")
+        );
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "-v" && pair[1] == format!("{}:/workspace", root.display())
+        }));
+        assert!(
+            args.windows(3)
+                .any(|pair| pair[0] == "sh" && pair[1] == "-lc" && pair[2] == "cargo test")
+        );
     }
 }

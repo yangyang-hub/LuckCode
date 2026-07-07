@@ -1,6 +1,6 @@
 # LuckCode
 
-LuckCode 是一个用 Rust 编写的本地 CLI Coding Agent。项目当前处于早期实现阶段：已经完成 workspace 骨架、CLI 入口、项目初始化、配置加载、只读本地工具、基础 session JSONL、第一版 Agent Loop、带 diff 预览/用户确认/checkpoint 的文件编辑系统（`edit_file` / `write_file` + `restore`）、带命令权限策略/确认/超时/输出截断的 `run_shell`、第一版 resume / compact / project memory、基础 symbol index、更完整的 system context、HTTP provider 超时/重试/错误展示，以及 stdio MCP tool discovery / tool call。
+LuckCode 是一个用 Rust 编写的本地 CLI Coding Agent。项目当前处于早期实现阶段：已经完成 workspace 骨架、CLI 入口、项目初始化、配置加载、只读本地工具、基础 session JSONL、第一版 Agent Loop、带 diff 预览/用户确认/checkpoint 的文件编辑系统（`edit_file` / `write_file` + `restore`）、编辑后的配置化自动测试、带命令权限策略/确认/超时/输出截断的 `run_shell`、第一版 resume / compact / project memory、tree-sitter-backed symbol index / function-level context、更完整的 system context、HTTP provider 超时/重试/错误展示，以及 stdio / HTTP MCP tool/resource/prompt discovery、tool call、细粒度 tool policy 和 Agent registry 集成。
 
 目标不是做玩具 Demo，而是逐步实现一个类似 Claude Code / Codex 的本地编程 Agent：
 
@@ -27,7 +27,10 @@ luckcode --compact
 - `luckcode tools call detect_project`：识别项目类型、manifest 和关键文件。
 - `luckcode tools call git_status`：查看 Git 状态。
 - `luckcode tools call git_diff`：查看 Git diff。
-- `luckcode tools call list_symbols` / `luckcode symbols`：列出常见源码文件里的函数、类型和模块符号。
+- `luckcode tools call list_symbols` / `luckcode symbols`：列出常见源码文件里的函数、类型和模块符号；Rust / TypeScript / TSX / Java 使用 tree-sitter 解析，其它支持语言使用轻量回退。
+- `luckcode tools call find_symbol`：查找符号并返回函数/类型级源码上下文。
+- `luckcode tools call find_references` / `luckcode references`：按标识符边界搜索符号引用，并返回源码上下文。
+- `luckcode tools call module_summary` / `luckcode module-summary`：按文件汇总模块、类型、函数、方法和 impl 符号。
 - `luckcode tools call edit_file`：用精确字符串替换修改已有文件（修改前展示 diff 并询问确认）。
 - `luckcode tools call write_file`：创建新文件（不允许覆盖已有文件）。
 - `luckcode tools call run_shell`：在工作区根目录执行 shell 命令；支持命令 allowlist / denylist / 默认策略配置，硬拒绝危险命令，并带超时和输出截断。
@@ -36,16 +39,18 @@ luckcode --compact
 - `luckcode ask --provider responses`：使用 OpenAI Responses API 请求格式。
 - `luckcode ask --provider anthropic`：使用 Anthropic Messages API 请求格式。
 - 普通 prompt 会进入 Agent Loop：`--plan` 模式只挂只读工具；其它模式下模型可调用 `edit_file` / `write_file` / `run_shell`。写文件前展示 diff、询问确认（`--accept-edits` 自动放行）并创建 checkpoint；shell 命令在 manual / accept-edits 下仍会询问，auto / dangerous 下会先展示命令再执行。
+- 配置了 `[commands].test` 后，Agent 在 `edit_file` / `write_file` 真正改动文件后会自动调用 `run_shell` 执行测试命令；测试失败结果会回传给下一轮模型继续修复。
 - Agent Loop 的 system context 会注入 `AGENTS.md`、项目类型、重要文件、工作区顶层概览、命令提示、源码概览、Git status/diff stat 和 project memory。
 - HTTP provider 支持配置化 `timeout_seconds` / `retry_attempts`；非 2xx 错误会显示 HTTP 状态和截断后的响应体，超时、连接错误、429 和 5xx 会重试。
 - `run_shell` 的权限策略优先级为：硬拒绝清单 → 配置 denylist → 配置 allowlist → 配置 default_policy 或当前权限模式。默认 allowlist 允许 `git status` / `git diff`，其它普通命令在 manual / sandbox 下仍会询问。
-- `--sandbox` 是第一版权限策略 sandbox：禁用文件编辑，但允许 shell 命令在硬拒绝清单和用户确认后执行。它还不是 Docker / container 隔离。
+- `--sandbox` 默认是第一版权限策略 sandbox：禁用文件编辑，但允许 shell 命令在硬拒绝清单和用户确认后执行；加 `--sandbox-executor docker` 后，`run_shell` 会通过 Docker 容器执行并默认禁用网络。
 - `luckcode restore [CHECKPOINT_ID]`：把当前项目最近一次 session 的最新 checkpoint（或指定 checkpoint）回滚。
 - `luckcode --resume [SESSION_ID] ["继续任务"]`：查看或继续当前项目的 session。
 - `luckcode --compact`：为当前项目最新 session 生成 compact summary 并写回 JSONL。
 - `luckcode memory show` / `memory set` / `memory remove`：管理当前项目的持久记忆。
 - `luckcode mcp list` / `mcp show`：检查 `.luckcode/mcp.json` 中配置的 MCP servers（env 值会被隐藏）。
-- `luckcode mcp tools SERVER` / `mcp call SERVER TOOL JSON`：启动 stdio MCP server，列出工具或调用工具。
+- `luckcode mcp tools SERVER` / `mcp resources SERVER` / `mcp prompts SERVER` / `mcp call SERVER TOOL JSON`：通过 stdio 或 HTTP MCP transport 列出工具、资源、提示或调用工具。
+- 非 `--plan` Agent 模式会把 MCP tools 注册为 `mcp_<server>_<tool>` 本地工具，并走与 shell 相同的确认 / allowlist / denylist 策略；`.luckcode/mcp.json` 可用 `tool_policies` 为单个 tool 配置 `allow` / `ask` / `deny`。
 - session JSONL 会记录 user、assistant、tool_call、tool_result、checkpoint 和 compact_summary。
 - `luckcode session list` / `session show` 可以浏览已有 session 和事件 timeline。
 
@@ -64,7 +69,12 @@ cargo run -p luckcode-cli -- tools call detect_project '{"include_previews":true
 cargo run -p luckcode-cli -- tools call git_status '{}'
 cargo run -p luckcode-cli -- tools call git_diff '{}'
 cargo run -p luckcode-cli -- tools call list_symbols '{"path":"crates","limit":100}'
+cargo run -p luckcode-cli -- tools call find_symbol '{"name":"run_agent","path":"crates/luckcode-core/src/lib.rs"}'
+cargo run -p luckcode-cli -- tools call find_references '{"name":"run_agent","path":"crates","limit":20}'
+cargo run -p luckcode-cli -- tools call module_summary '{"path":"crates/luckcode-core/src/lib.rs"}'
 cargo run -p luckcode-cli -- symbols crates --limit 100
+cargo run -p luckcode-cli -- references run_agent crates --limit 20
+cargo run -p luckcode-cli -- module-summary crates/luckcode-core/src/lib.rs
 cargo run -p luckcode-cli -- tools call edit_file '{"path":"README.md","old_string":"LuckCode","new_string":"LuckCode"}'
 cargo run -p luckcode-cli -- tools call write_file '{"path":"notes.txt","content":"hello\n"}'
 cargo run -p luckcode-cli -- tools call run_shell '{"command":"cargo test","timeout_seconds":120}'
@@ -76,6 +86,7 @@ cargo run -p luckcode-cli -- --provider mock --model mock "分析这个项目"
 cargo run -p luckcode-cli -- --plan "分析这个项目"
 cargo run -p luckcode-cli -- --accept-edits "修复这个 clippy warning"
 cargo run -p luckcode-cli -- --sandbox "运行 cargo test 并总结失败"
+cargo run -p luckcode-cli -- --sandbox --sandbox-executor docker --sandbox-image rust:1.93 "运行 cargo test 并总结失败"
 cargo run -p luckcode-cli -- restore
 cargo run -p luckcode-cli -- session list
 cargo run -p luckcode-cli -- session show
@@ -87,6 +98,8 @@ cargo run -p luckcode-cli -- memory set project.test_command "cargo test"
 cargo run -p luckcode-cli -- mcp list
 cargo run -p luckcode-cli -- mcp show local
 cargo run -p luckcode-cli -- mcp tools local
+cargo run -p luckcode-cli -- mcp resources local
+cargo run -p luckcode-cli -- mcp prompts local
 cargo run -p luckcode-cli -- mcp call local lookup '{"key":"value"}'
 ```
 
@@ -141,6 +154,7 @@ enabled = true
 
 ```toml
 [commands]
+# Agent 会在文件被实际修改后自动运行该测试命令。
 test = "cargo test"
 check = "cargo check"
 lint = "cargo clippy"
@@ -260,6 +274,26 @@ AGENTS.md
 .luckcode/ignore
 ```
 
+`.luckcode/mcp.json` 支持 stdio 和 HTTP MCP server：
+
+```json
+{
+  "mcpServers": {
+    "local": {
+      "command": "node",
+      "args": ["server.js"],
+      "env": { "API_KEY": "..." },
+      "tool_policies": { "lookup": "allow", "delete": "deny" }
+    },
+    "remote": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ..." },
+      "tool_policies": { "*": "ask" }
+    }
+  }
+}
+```
+
 配置优先级：
 
 1. 默认配置。
@@ -280,7 +314,6 @@ AGENTS.md
 
 ## 下一阶段
 
-1. 完善测试失败后的自动重试策略。
-2. 将 MCP stdio tools 接入 Agent tool registry 和权限系统。
-3. 用 tree-sitter 增强 symbol index 与 function-level context。
-4. 接入 ratatui TUI，提供交互式 diff、tool call timeline 和 session browser。
+1. 接入 ratatui TUI，提供交互式 diff、tool call timeline 和 session browser。
+2. 完善 Docker sandbox 的镜像选择、缓存挂载和跨平台路径处理。
+3. 增加 eval runner 和 release 打包流程。

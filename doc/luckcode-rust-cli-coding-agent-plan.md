@@ -1155,7 +1155,7 @@ luckcode restore
 
 ### v0.3：可验证 Coding Agent
 
-> 状态：第一版已实现 `run_shell`、命令权限策略、危险命令拦截、配置化 allowlist / denylist / default policy、超时和输出截断；测试失败后的自动重试策略仍需继续细化。
+> 状态：第一版已实现 `run_shell`、命令权限策略、危险命令拦截、配置化 allowlist / denylist / default policy、超时和输出截断；配置了 `[commands].test` 后，Agent 会在文件编辑成功后自动运行测试命令，并把失败结果回传给下一轮模型继续修复。
 
 能力：
 
@@ -1163,7 +1163,7 @@ luckcode restore
 - 第一版权限系统（`CommandPolicy` / `PermissionEngine`、已实现）
 - 命令 allowlist / denylist / default policy 配置（已实现）
 - 测试验证（可通过 `run_shell` 执行配置的测试命令）
-- 失败重试（Agent Loop 可基于 tool result 继续迭代，后续补更明确策略）
+- 失败重试（编辑后自动运行测试，失败 tool result 回传 Agent 继续迭代，已实现基础版）
 
 命令：
 
@@ -1191,13 +1191,15 @@ luckcode --compact
 
 ### v0.5：代码智能
 
-> 状态：基础版已实现。当前提供 parser-free symbol index（`luckcode symbols` / `list_symbols`），覆盖常见 Rust/TS/JS/Python/Go/Java 函数和类型定义；tree-sitter 精准解析仍是后续增强。
+> 状态：baseline 已实现。`luckcode symbols` / `list_symbols`、`find_symbol`、`find_references` 和 `module_summary` 已提供代码智能基础能力；Rust / TypeScript / TSX / Java 使用 tree-sitter 提供 AST 级起止行，JS/Python/Go 继续使用轻量解析回退。
 
 能力：
 
-- tree-sitter（后续增强）
-- symbol index（基础版已实现）
-- function-level context（后续增强）
+- tree-sitter（Rust / TypeScript / TSX / Java baseline 已实现）
+- symbol index（已实现）
+- function-level context（已实现）
+- find_references 简化版（已实现）
+- module summary（已实现）
 
 命令：
 
@@ -1208,24 +1210,24 @@ luckcode "解释这个函数的调用链"
 
 ### v0.6：MCP
 
-> 状态：stdio 基础版已实现。当前支持 `luckcode mcp list/show` 读取 `.luckcode/mcp.json` 并隐藏 env 值，也支持 `luckcode mcp tools <server>` 和 `luckcode mcp call <server> <tool> <json>` 启动 stdio MCP server 做 tool discovery / tool call；HTTP transport、Agent tool registry 集成和 MCP 权限细化仍需继续实现。
+> 状态：baseline 已实现。当前支持 `luckcode mcp list/show` 读取 `.luckcode/mcp.json` 并隐藏 env / headers 值，也支持 `luckcode mcp tools/resources/prompts <server>` 和 `luckcode mcp call <server> <tool> <json>` 通过 stdio 或 Streamable HTTP baseline 做 tool/resource/prompt discovery 和 tool call；非 `--plan` Agent 模式会把 MCP tools 注册为 `mcp_<server>_<tool>`，并走同一套确认 / allowlist / denylist 策略。`tool_policies` 支持按 MCP tool 配置 `allow` / `ask` / `deny`。
 
 能力：
 
-- MCP client（stdio 基础版已实现）
-- MCP tool discovery / tool call（stdio 基础版已实现）
-- MCP tool registry（后续）
-- MCP permission（后续）
+- MCP client（stdio / HTTP baseline 已实现）
+- MCP tool discovery / tool call（stdio / HTTP baseline 已实现）
+- MCP tool registry（已实现）
+- MCP permission（command policy + per-tool `tool_policies` baseline 已实现）
 
 ### v0.7：Sandbox
 
-> 状态：权限策略 baseline 已实现。`--sandbox` 禁用文件编辑，shell 命令仍需确认并经过硬拒绝策略；Docker / container 隔离仍需后续实现。
+> 状态：baseline 已实现。`--sandbox` 默认禁用文件编辑，shell 命令仍需确认并经过硬拒绝策略；加 `--sandbox-executor docker` 后，`run_shell` 通过 Docker `run --rm --network none -v <workspace>:/workspace -w /workspace <image> sh -lc <command>` 执行。后续增强是镜像选择策略、缓存挂载、跨平台路径处理和更完整的 network policy。
 
 能力：
 
-- Docker executor（后续）
+- Docker executor（baseline 已实现）
 - readonly mode（权限策略 baseline 已实现）
-- network policy（后续）
+- network policy（baseline：Docker executor 默认 `--network none`）
 
 ### v0.8：TUI
 

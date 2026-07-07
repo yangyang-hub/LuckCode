@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use futures_util::{StreamExt, future::BoxFuture};
 use ignore::WalkBuilder;
 use luckcode_model::{
@@ -9,7 +10,11 @@ use luckcode_storage::{
     SessionInfo, append_session_compact_summary, append_session_message, append_session_tool_call,
     append_session_tool_result, project_hash, read_project_memory, read_session_events,
 };
-use luckcode_tools::{CommandPolicyConfig, ToolCall as LocalToolCall, ToolContext, ToolRegistry};
+use luckcode_tools::{
+    CommandApproval, CommandPolicy, CommandPolicyConfig, CommandPolicyDecision, CommandPreview,
+    PermissionEngine, Tool, ToolCall as LocalToolCall, ToolContext, ToolOutput, ToolRegistry,
+};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -29,6 +34,7 @@ pub struct AgentOptions {
     pub max_steps: usize,
     pub stream: bool,
     pub resume_summary: Option<String>,
+    pub verification: Option<VerificationOptions>,
 }
 
 impl Default for AgentOptions {
@@ -37,6 +43,24 @@ impl Default for AgentOptions {
             max_steps: 8,
             stream: true,
             resume_summary: None,
+            verification: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationOptions {
+    pub command: String,
+    pub timeout_seconds: u64,
+    pub max_output_bytes: usize,
+}
+
+impl VerificationOptions {
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            timeout_seconds: 120,
+            max_output_bytes: 40_000,
         }
     }
 }
@@ -116,16 +140,40 @@ pub async fn run_agent(
             });
         }
 
+        let model_requested_shell = tool_calls.iter().any(|call| call.name == "run_shell");
         for call in tool_calls {
             let record = execute_tool_call(session, tools, tool_context.clone(), call).await?;
+            let should_verify = should_verify_after_tool(&record);
             messages.push(Message {
                 role: MessageRole::Tool,
                 content: record.message_content.clone(),
             });
             tool_records.push(AgentToolCallRecord {
-                name: record.name,
+                name: record.name.clone(),
                 ok: record.ok,
             });
+
+            if should_verify
+                && !model_requested_shell
+                && let Some(verification) = &options.verification
+                && !verification.command.trim().is_empty()
+            {
+                let verification_record = execute_tool_call(
+                    session,
+                    tools,
+                    tool_context.clone(),
+                    verification_tool_call(verification),
+                )
+                .await?;
+                messages.push(Message {
+                    role: MessageRole::Tool,
+                    content: verification_record.message_content.clone(),
+                });
+                tool_records.push(AgentToolCallRecord {
+                    name: verification_record.name,
+                    ok: verification_record.ok,
+                });
+            }
         }
     }
 
@@ -142,6 +190,7 @@ struct ExecutedToolCall {
     name: String,
     ok: bool,
     message_content: String,
+    metadata: serde_json::Value,
 }
 
 async fn execute_tool_call(
@@ -180,6 +229,7 @@ async fn execute_tool_call(
                     "tool_result:{name}\nmetadata:{}\ntruncated:{}\n{}",
                     output.metadata, output.truncated, output.content
                 ),
+                metadata: output.metadata,
             })
         }
         Err(error) => {
@@ -195,8 +245,45 @@ async fn execute_tool_call(
                 name: name.clone(),
                 ok: false,
                 message_content: format!("tool_result:{name}\n{content}"),
+                metadata: serde_json::json!({ "error": true }),
             })
         }
+    }
+}
+
+fn should_verify_after_tool(record: &ExecutedToolCall) -> bool {
+    if !record.ok || !matches!(record.name.as_str(), "edit_file" | "write_file") {
+        return false;
+    }
+    if record
+        .metadata
+        .get("skipped")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if record.name == "edit_file"
+        && record
+            .metadata
+            .get("replaced")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+    {
+        return false;
+    }
+    true
+}
+
+fn verification_tool_call(verification: &VerificationOptions) -> ModelToolCall {
+    ModelToolCall {
+        id: Some("luckcode_auto_verify".to_string()),
+        name: "run_shell".to_string(),
+        arguments: serde_json::json!({
+            "command": verification.command,
+            "timeout_seconds": verification.timeout_seconds,
+            "max_output_bytes": verification.max_output_bytes,
+        }),
     }
 }
 
@@ -1148,6 +1235,8 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub url: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub tool_policies: BTreeMap<String, CommandPolicy>,
     pub disabled: bool,
 }
 
@@ -1164,6 +1253,12 @@ pub struct McpToolInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolRegistrationReport {
+    pub registered_tools: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1215,14 +1310,7 @@ pub async fn list_mcp_tools(
     server: &McpServerConfig,
     timeout_seconds: u64,
 ) -> Result<Vec<McpToolInfo>> {
-    let result = with_mcp_stdio_session(server, timeout_seconds, |stdin, reader| {
-        Box::pin(async move {
-            initialize_mcp(stdin, reader).await?;
-            send_mcp_request(stdin, 2, "tools/list", serde_json::json!({})).await?;
-            read_mcp_response(reader, 2).await
-        })
-    })
-    .await?;
+    let result = mcp_request(server, timeout_seconds, "tools/list", serde_json::json!({})).await?;
 
     parse_mcp_tools_result(&result)
 }
@@ -1238,23 +1326,449 @@ pub async fn call_mcp_tool(
     }
 
     let tool_name = tool_name.to_string();
-    with_mcp_stdio_session(server, timeout_seconds, move |stdin, reader| {
-        Box::pin(async move {
-            initialize_mcp(stdin, reader).await?;
-            send_mcp_request(
-                stdin,
-                2,
-                "tools/call",
-                serde_json::json!({
-                    "name": tool_name,
-                    "arguments": arguments,
-                }),
-            )
-            .await?;
-            read_mcp_response(reader, 2).await
-        })
-    })
+    mcp_request(
+        server,
+        timeout_seconds,
+        "tools/call",
+        serde_json::json!({
+            "name": tool_name,
+            "arguments": arguments,
+        }),
+    )
     .await
+}
+
+pub async fn list_mcp_resources(
+    server: &McpServerConfig,
+    timeout_seconds: u64,
+) -> Result<serde_json::Value> {
+    mcp_simple_request(server, timeout_seconds, "resources/list").await
+}
+
+pub async fn list_mcp_prompts(
+    server: &McpServerConfig,
+    timeout_seconds: u64,
+) -> Result<serde_json::Value> {
+    mcp_simple_request(server, timeout_seconds, "prompts/list").await
+}
+
+async fn mcp_simple_request(
+    server: &McpServerConfig,
+    timeout_seconds: u64,
+    method: &'static str,
+) -> Result<serde_json::Value> {
+    mcp_request(server, timeout_seconds, method, serde_json::json!({})).await
+}
+
+async fn mcp_request(
+    server: &McpServerConfig,
+    timeout_seconds: u64,
+    method: &'static str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    if server.url.is_some() {
+        mcp_http_request(server, timeout_seconds, method, params).await
+    } else {
+        with_mcp_stdio_session(server, timeout_seconds, move |stdin, reader| {
+            Box::pin(async move {
+                initialize_mcp(stdin, reader).await?;
+                send_mcp_request(stdin, 2, method, params).await?;
+                read_mcp_response(reader, 2).await
+            })
+        })
+        .await
+    }
+}
+
+async fn mcp_http_request(
+    server: &McpServerConfig,
+    timeout_seconds: u64,
+    method: &'static str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    if server.disabled {
+        anyhow::bail!("MCP server is disabled");
+    }
+    let url = server
+        .url
+        .as_deref()
+        .context("MCP HTTP server requires a url")?;
+    let timeout_seconds = timeout_seconds.clamp(1, 120);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_seconds))
+        .build()
+        .context("failed to build MCP HTTP client")?;
+
+    let initialize = mcp_jsonrpc_message(1, "initialize", mcp_initialize_params());
+    let (_, session_id) =
+        send_mcp_http_jsonrpc(&client, server, url, initialize, None, Some(1)).await?;
+
+    let initialized = mcp_jsonrpc_notification("notifications/initialized", serde_json::json!({}));
+    send_mcp_http_jsonrpc(
+        &client,
+        server,
+        url,
+        initialized,
+        session_id.as_deref(),
+        None,
+    )
+    .await?;
+
+    let request = mcp_jsonrpc_message(2, method, params);
+    let (result, _) = send_mcp_http_jsonrpc(
+        &client,
+        server,
+        url,
+        request,
+        session_id.as_deref(),
+        Some(2),
+    )
+    .await?;
+    Ok(result)
+}
+
+async fn send_mcp_http_jsonrpc(
+    client: &reqwest::Client,
+    server: &McpServerConfig,
+    url: &str,
+    message: serde_json::Value,
+    session_id: Option<&str>,
+    expected_id: Option<u64>,
+) -> Result<(serde_json::Value, Option<String>)> {
+    let mut request = client
+        .post(url)
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "application/json, text/event-stream")
+        .json(&message);
+    if let Some(session_id) = session_id {
+        request = request.header("Mcp-Session-Id", session_id);
+    }
+    for (key, value) in &server.headers {
+        let name = HeaderName::from_bytes(key.as_bytes())
+            .with_context(|| format!("invalid MCP HTTP header name '{key}'"))?;
+        let value = HeaderValue::from_str(value)
+            .with_context(|| format!("invalid MCP HTTP header value for '{key}'"))?;
+        request = request.header(name, value);
+    }
+
+    let response = request
+        .send()
+        .await
+        .context("failed to send MCP HTTP request")?;
+    let status = response.status();
+    let session_id = response
+        .headers()
+        .get("Mcp-Session-Id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let body = response
+        .text()
+        .await
+        .context("failed to read MCP HTTP response")?;
+    if !status.is_success() {
+        let (body, _) = truncate_text_bytes(&body, 2_000);
+        anyhow::bail!("MCP HTTP request failed with status {status}: {body}");
+    }
+
+    let Some(expected_id) = expected_id else {
+        return Ok((serde_json::Value::Null, session_id));
+    };
+    let result = parse_mcp_http_response_body(&body, expected_id)?;
+    Ok((result, session_id))
+}
+
+fn parse_mcp_http_response_body(body: &str, expected_id: u64) -> Result<serde_json::Value> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("MCP HTTP response {expected_id} was empty");
+    }
+
+    if let Ok(message) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return mcp_result_from_message(&message, expected_id);
+    }
+
+    for line in trimmed.lines() {
+        let Some(data) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let message: serde_json::Value =
+            serde_json::from_str(data).context("failed to parse MCP SSE JSON-RPC data")?;
+        if mcp_id_matches(&message, expected_id) {
+            return mcp_result_from_message(&message, expected_id);
+        }
+    }
+
+    anyhow::bail!("MCP HTTP response did not contain response id {expected_id}")
+}
+
+pub async fn register_mcp_tools(
+    registry: &mut ToolRegistry,
+    config: &McpConfig,
+    timeout_seconds: u64,
+) -> McpToolRegistrationReport {
+    let mut registered_tools = Vec::new();
+    let mut errors = Vec::new();
+
+    for (server_name, server) in &config.servers {
+        if server.disabled {
+            continue;
+        }
+        match list_mcp_tools(server, timeout_seconds).await {
+            Ok(tools) => {
+                for tool in tools {
+                    let local_name = mcp_tool_local_name(server_name, &tool.name);
+                    let description = mcp_tool_description(server_name, &tool);
+                    registry.register(McpTool {
+                        local_name: local_name.clone(),
+                        description,
+                        server_name: server_name.clone(),
+                        tool_name: tool.name,
+                        server: server.clone(),
+                        input_schema: tool.input_schema,
+                        timeout_seconds,
+                    });
+                    registered_tools.push(local_name);
+                }
+            }
+            Err(error) => {
+                errors.push(format!("{server_name}: {error:#}"));
+            }
+        }
+    }
+
+    McpToolRegistrationReport {
+        registered_tools,
+        errors,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpTool {
+    local_name: String,
+    description: String,
+    server_name: String,
+    tool_name: String,
+    server: McpServerConfig,
+    input_schema: serde_json::Value,
+    timeout_seconds: u64,
+}
+
+#[async_trait]
+impl Tool for McpTool {
+    fn name(&self) -> &str {
+        &self.local_name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        self.input_schema.clone()
+    }
+
+    async fn execute(&self, input: serde_json::Value, ctx: ToolContext) -> Result<ToolOutput> {
+        match authorize_mcp_tool(
+            &ctx,
+            &self.server,
+            &self.server_name,
+            &self.tool_name,
+            self.timeout_seconds,
+            40_000,
+        )? {
+            McpToolOutcome::Skipped { preview } => Ok(ToolOutput {
+                content: format!("MCP tool skipped by user: {}\n", preview.command),
+                metadata: serde_json::json!({
+                    "mcp": true,
+                    "server": self.server_name,
+                    "tool": self.tool_name,
+                    "skipped": true,
+                }),
+                truncated: false,
+            }),
+            McpToolOutcome::Run { preview, prompted } => {
+                if !prompted && let Some(announce) = &ctx.announce_command {
+                    announce(&preview);
+                }
+                let result =
+                    call_mcp_tool(&self.server, &self.tool_name, input, self.timeout_seconds)
+                        .await?;
+                let content =
+                    serde_json::to_string_pretty(&result).context("failed to render MCP result")?;
+                let bytes = content.len();
+                let (content, truncated) = truncate_text_bytes(&content, 40_000);
+                let is_error = result
+                    .get("isError")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                Ok(ToolOutput {
+                    content,
+                    metadata: serde_json::json!({
+                        "mcp": true,
+                        "server": self.server_name,
+                        "tool": self.tool_name,
+                        "bytes": bytes,
+                        "error": is_error,
+                    }),
+                    truncated,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum McpToolOutcome {
+    Run {
+        preview: CommandPreview,
+        prompted: bool,
+    },
+    Skipped {
+        preview: CommandPreview,
+    },
+}
+
+fn authorize_mcp_tool(
+    ctx: &ToolContext,
+    server: &McpServerConfig,
+    server_name: &str,
+    tool_name: &str,
+    timeout_seconds: u64,
+    max_output_bytes: usize,
+) -> Result<McpToolOutcome> {
+    let default_policy = match ctx.command_approval {
+        CommandApproval::Refuse => CommandPolicy::Deny,
+        CommandApproval::Prompt => CommandPolicy::Ask,
+        CommandApproval::Auto => CommandPolicy::Allow,
+    };
+    let policy_config = if ctx.command_approval == CommandApproval::Refuse {
+        CommandPolicyConfig {
+            default_policy: None,
+            allowlist: Vec::new(),
+            denylist: ctx.command_policy.denylist.clone(),
+        }
+    } else {
+        ctx.command_policy.clone()
+    };
+    let command = format!("mcp {server_name} {tool_name}");
+    let decision = match mcp_tool_policy(server, tool_name) {
+        Some(policy) if ctx.command_approval != CommandApproval::Refuse => CommandPolicyDecision {
+            policy,
+            reason: format!("MCP tool policy configured as {policy:?}"),
+        },
+        _ => PermissionEngine::new(default_policy).evaluate_command(&command, &policy_config),
+    };
+    let working_dir = ctx
+        .workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| ctx.workspace_root.clone());
+    let preview = CommandPreview {
+        command,
+        working_dir,
+        timeout_seconds,
+        max_output_bytes,
+        reason: decision.reason.clone(),
+    };
+
+    match decision.policy {
+        CommandPolicy::Deny => anyhow::bail!("MCP tool denied: {}", decision.reason),
+        CommandPolicy::Allow => Ok(McpToolOutcome::Run {
+            preview,
+            prompted: false,
+        }),
+        CommandPolicy::Ask => {
+            let Some(confirm) = &ctx.confirm_command else {
+                anyhow::bail!(
+                    "interactive MCP confirmation is unavailable; rerun in auto mode or configure manual confirmation"
+                );
+            };
+            if !confirm(&preview) {
+                return Ok(McpToolOutcome::Skipped { preview });
+            }
+            Ok(McpToolOutcome::Run {
+                preview,
+                prompted: true,
+            })
+        }
+    }
+}
+
+fn mcp_tool_local_name(server_name: &str, tool_name: &str) -> String {
+    format!(
+        "mcp_{}_{}",
+        sanitize_mcp_identifier(server_name),
+        sanitize_mcp_identifier(tool_name)
+    )
+}
+
+fn mcp_tool_policy(server: &McpServerConfig, tool_name: &str) -> Option<CommandPolicy> {
+    server
+        .tool_policies
+        .get(tool_name)
+        .copied()
+        .or_else(|| server.tool_policies.get("*").copied())
+}
+
+fn mcp_tool_description(server_name: &str, tool: &McpToolInfo) -> String {
+    match tool.description.as_deref() {
+        Some(description) if !description.trim().is_empty() => {
+            format!(
+                "MCP tool '{}' from server '{}': {description}",
+                tool.name, server_name
+            )
+        }
+        _ => format!("MCP tool '{}' from server '{}'.", tool.name, server_name),
+    }
+}
+
+fn sanitize_mcp_identifier(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_underscore = false;
+    for ch in value.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else {
+            Some('_')
+        };
+        if let Some(ch) = normalized {
+            if ch == '_' {
+                if !last_was_underscore && !out.is_empty() {
+                    out.push('_');
+                }
+                last_was_underscore = true;
+            } else {
+                out.push(ch);
+                last_was_underscore = false;
+            }
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        "tool".to_string()
+    } else {
+        out
+    }
+}
+
+fn truncate_text_bytes(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = text[..end].to_string();
+    if !truncated.ends_with('\n') {
+        truncated.push('\n');
+    }
+    truncated.push_str(&format!("[MCP result truncated after {max_bytes} bytes]\n"));
+    (truncated, true)
 }
 
 async fn with_mcp_stdio_session<F>(
@@ -1270,9 +1784,6 @@ where
 {
     if server.disabled {
         anyhow::bail!("MCP server is disabled");
-    }
-    if server.url.is_some() {
-        anyhow::bail!("HTTP MCP transport is not implemented yet; configure a stdio server");
     }
     let command_name = server
         .command
@@ -1322,22 +1833,20 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
 {
-    send_mcp_request(
-        stdin,
-        1,
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "luckcode",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        }),
-    )
-    .await?;
+    send_mcp_request(stdin, 1, "initialize", mcp_initialize_params()).await?;
     read_mcp_response(reader, 1).await?;
     send_mcp_notification(stdin, "notifications/initialized", serde_json::json!({})).await
+}
+
+fn mcp_initialize_params() -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {
+            "name": "luckcode",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    })
 }
 
 async fn send_mcp_request<W>(
@@ -1349,12 +1858,7 @@ async fn send_mcp_request<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let message = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    });
+    let message = mcp_jsonrpc_message(id, method, params);
     write_mcp_message(stdin, &message).await
 }
 
@@ -1366,12 +1870,25 @@ async fn send_mcp_notification<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let message = serde_json::json!({
+    let message = mcp_jsonrpc_notification(method, params);
+    write_mcp_message(stdin, &message).await
+}
+
+fn mcp_jsonrpc_message(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+}
+
+fn mcp_jsonrpc_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
         "jsonrpc": "2.0",
         "method": method,
         "params": params,
-    });
-    write_mcp_message(stdin, &message).await
+    })
 }
 
 async fn write_mcp_message<W>(stdin: &mut W, message: &serde_json::Value) -> Result<()>
@@ -1407,16 +1924,37 @@ where
         if !mcp_id_matches(&message, expected_id) {
             continue;
         }
-        if let Some(error) = message.get("error") {
-            anyhow::bail!("MCP request {expected_id} failed: {}", compact_json(error));
-        }
-        return Ok(message
-            .get("result")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null));
+        return mcp_result_from_message(&message, expected_id);
     }
 
     anyhow::bail!("MCP server closed stdout before response {expected_id}")
+}
+
+fn mcp_result_from_message(
+    message: &serde_json::Value,
+    expected_id: u64,
+) -> Result<serde_json::Value> {
+    if message.is_array() {
+        let Some(matching) = message.as_array().and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| mcp_id_matches(message, expected_id))
+        }) else {
+            anyhow::bail!("MCP response batch did not contain id {expected_id}");
+        };
+        return mcp_result_from_message(matching, expected_id);
+    }
+
+    if !mcp_id_matches(message, expected_id) {
+        anyhow::bail!("MCP response id did not match expected id {expected_id}");
+    }
+    if let Some(error) = message.get("error") {
+        anyhow::bail!("MCP request {expected_id} failed: {}", compact_json(error));
+    }
+    Ok(message
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 fn mcp_id_matches(message: &serde_json::Value, expected_id: u64) -> bool {
@@ -1997,6 +2535,55 @@ mod tests {
     }
 
     #[test]
+    fn verification_runs_only_after_real_file_changes() {
+        let changed_edit = ExecutedToolCall {
+            name: "edit_file".to_string(),
+            ok: true,
+            message_content: String::new(),
+            metadata: serde_json::json!({ "replaced": 1 }),
+        };
+        let skipped_write = ExecutedToolCall {
+            name: "write_file".to_string(),
+            ok: true,
+            message_content: String::new(),
+            metadata: serde_json::json!({ "skipped": true }),
+        };
+        let noop_edit = ExecutedToolCall {
+            name: "edit_file".to_string(),
+            ok: true,
+            message_content: String::new(),
+            metadata: serde_json::json!({ "replaced": 0 }),
+        };
+        let read_file = ExecutedToolCall {
+            name: "read_file".to_string(),
+            ok: true,
+            message_content: String::new(),
+            metadata: serde_json::json!({}),
+        };
+
+        assert!(should_verify_after_tool(&changed_edit));
+        assert!(!should_verify_after_tool(&skipped_write));
+        assert!(!should_verify_after_tool(&noop_edit));
+        assert!(!should_verify_after_tool(&read_file));
+    }
+
+    #[test]
+    fn verification_tool_call_uses_run_shell_shape() {
+        let verification = VerificationOptions {
+            command: "cargo test".to_string(),
+            timeout_seconds: 30,
+            max_output_bytes: 1024,
+        };
+
+        let call = verification_tool_call(&verification);
+
+        assert_eq!(call.name, "run_shell");
+        assert_eq!(call.arguments["command"], "cargo test");
+        assert_eq!(call.arguments["timeout_seconds"], 30);
+        assert_eq!(call.arguments["max_output_bytes"], 1024);
+    }
+
+    #[test]
     fn project_context_includes_workspace_commands_and_source_overview() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path();
@@ -2026,7 +2613,9 @@ mod tests {
                 "local": {
                   "command": "node",
                   "args": ["server.js"],
-                  "env": { "API_KEY": "secret" }
+                  "env": { "API_KEY": "secret" },
+                  "headers": { "Authorization": "Bearer secret" },
+                  "tool_policies": { "lookup": "allow", "delete": "deny" }
                 }
               }
             }"#,
@@ -2039,6 +2628,18 @@ mod tests {
         assert_eq!(
             server.env.get("API_KEY").map(String::as_str),
             Some("secret")
+        );
+        assert_eq!(
+            server.headers.get("Authorization").map(String::as_str),
+            Some("Bearer secret")
+        );
+        assert_eq!(
+            server.tool_policies.get("lookup"),
+            Some(&CommandPolicy::Allow)
+        );
+        assert_eq!(
+            server.tool_policies.get("delete"),
+            Some(&CommandPolicy::Deny)
         );
     }
 
@@ -2072,5 +2673,84 @@ mod tests {
         assert!(mcp_id_matches(&serde_json::json!({ "id": 2 }), 2));
         assert!(mcp_id_matches(&serde_json::json!({ "id": "2" }), 2));
         assert!(!mcp_id_matches(&serde_json::json!({ "id": 3 }), 2));
+    }
+
+    #[test]
+    fn parses_mcp_http_json_and_sse_responses() {
+        let json =
+            parse_mcp_http_response_body(r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#, 2)
+                .expect("parse json response");
+        assert_eq!(json["tools"], serde_json::json!([]));
+
+        let sse = parse_mcp_http_response_body(
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"2\",\"result\":{\"ok\":true}}\n\n",
+            2,
+        )
+        .expect("parse sse response");
+        assert_eq!(sse["ok"], true);
+    }
+
+    #[test]
+    fn mcp_tool_local_names_are_sanitized() {
+        assert_eq!(
+            mcp_tool_local_name("Local Server", "lookup.value"),
+            "mcp_local_server_lookup_value"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_authorization_uses_command_confirmation() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let ctx = ToolContext::new(tmp.path(), 200_000)
+            .with_command_approval(CommandApproval::Prompt)
+            .with_confirm_command(std::sync::Arc::new(|preview| {
+                assert_eq!(preview.command, "mcp local lookup");
+                false
+            }));
+        let server = McpServerConfig::default();
+
+        let outcome = authorize_mcp_tool(&ctx, &server, "local", "lookup", 30, 10_000)
+            .expect("authorization should prompt");
+
+        assert!(matches!(outcome, McpToolOutcome::Skipped { .. }));
+    }
+
+    #[test]
+    fn mcp_tool_authorization_uses_per_tool_policy() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let mut server = McpServerConfig::default();
+        server
+            .tool_policies
+            .insert("lookup".to_string(), CommandPolicy::Allow);
+        let ctx =
+            ToolContext::new(tmp.path(), 200_000).with_command_approval(CommandApproval::Prompt);
+
+        let outcome = authorize_mcp_tool(&ctx, &server, "local", "lookup", 30, 10_000)
+            .expect("tool policy should allow");
+
+        assert!(matches!(
+            outcome,
+            McpToolOutcome::Run {
+                prompted: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mcp_tool_authorization_uses_configured_denylist() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let ctx = ToolContext::new(tmp.path(), 200_000)
+            .with_command_approval(CommandApproval::Auto)
+            .with_command_policy(CommandPolicyConfig {
+                default_policy: None,
+                allowlist: Vec::new(),
+                denylist: vec!["mcp local lookup".to_string()],
+            });
+        let server = McpServerConfig::default();
+
+        let error = authorize_mcp_tool(&ctx, &server, "local", "lookup", 30, 10_000).unwrap_err();
+
+        assert!(format!("{error:#}").contains("configured pattern"));
     }
 }

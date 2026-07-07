@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use luckcode_core::{
     AgentOptions, AppConfig, InitFileAction, InitOptions, PermissionMode, ResolvedProviderConfig,
-    call_mcp_tool, compact_session, compact_summary_for_session, config_to_toml, init_project,
-    list_mcp_tools, load_config, load_mcp_config, resolve_provider_config, run_agent,
+    VerificationOptions, call_mcp_tool, compact_session, compact_summary_for_session,
+    config_to_toml, init_project, list_mcp_prompts, list_mcp_resources, list_mcp_tools,
+    load_config, load_mcp_config, register_mcp_tools, resolve_provider_config, run_agent,
 };
 use luckcode_model::{
     AnthropicProvider, Message, MessageRole, MockProvider, ModelEvent, ModelHttpOptions,
@@ -18,9 +19,9 @@ use luckcode_storage::{
     set_project_memory,
 };
 use luckcode_tools::{
-    AnnounceCommand, CommandApproval, CommandPolicyConfig, CommandPreview, ConfirmCommand,
-    CreateCheckpoint, EditApproval, EditPreview, ToolCall, ToolContext, full_registry,
-    readonly_registry,
+    AnnounceCommand, CommandApproval, CommandExecutor, CommandPolicy, CommandPolicyConfig,
+    CommandPreview, ConfirmCommand, CreateCheckpoint, EditApproval, EditPreview, ToolCall,
+    ToolContext, full_registry, readonly_registry,
 };
 use std::{
     env, fs,
@@ -49,6 +50,12 @@ struct Cli {
 
     #[arg(long)]
     sandbox: bool,
+
+    #[arg(long, value_enum, default_value_t = SandboxExecutorArg::Local)]
+    sandbox_executor: SandboxExecutorArg,
+
+    #[arg(long, default_value = "rust:1.93")]
+    sandbox_image: String,
 
     #[arg(long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
     resume: Option<String>,
@@ -104,6 +111,22 @@ enum Commands {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
+    References {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: String,
+        #[arg(long, default_value_t = 1)]
+        context_lines: usize,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    ModuleSummary {
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: String,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
     Session {
         #[command(subcommand)]
         command: Option<SessionCommand>,
@@ -120,6 +143,22 @@ enum Commands {
         #[arg(value_name = "CHECKPOINT_ID")]
         checkpoint_id: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SandboxExecutorArg {
+    Local,
+    Docker,
+}
+
+#[derive(Debug, Clone)]
+struct PromptOptions {
+    plan: bool,
+    accept_edits: bool,
+    sandbox: bool,
+    command_executor: CommandExecutor,
+    provider_override: Option<String>,
+    model_override: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -165,6 +204,16 @@ enum McpCommand {
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
     },
+    Resources {
+        server: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
+    Prompts {
+        server: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
     Call {
         server: String,
         tool: String,
@@ -189,6 +238,16 @@ async fn run() -> Result<()> {
     if cli.accept_edits && cli.sandbox {
         anyhow::bail!("--accept-edits and --sandbox cannot be used together");
     }
+    let command_executor =
+        command_executor_from_cli(cli.sandbox, cli.sandbox_executor, cli.sandbox_image.clone())?;
+    let prompt_options = PromptOptions {
+        plan: cli.plan,
+        accept_edits: cli.accept_edits,
+        sandbox: cli.sandbox,
+        command_executor,
+        provider_override: cli.provider.clone(),
+        model_override: cli.model.clone(),
+    };
 
     if cli.diff {
         return print_git_diff();
@@ -202,51 +261,29 @@ async fn run() -> Result<()> {
         if cli.command.is_some() {
             anyhow::bail!("--resume cannot be combined with subcommands");
         }
-        return run_resumed_prompt(
-            cli.prompt,
-            session_id,
-            cli.plan,
-            cli.accept_edits,
-            cli.sandbox,
-            cli.provider,
-            cli.model,
-        )
-        .await;
+        return run_resumed_prompt(cli.prompt, session_id, prompt_options).await;
     }
 
     match cli.command {
         Some(Commands::Init { force }) => handle_init(force),
         Some(Commands::Config { command }) => handle_config(command),
         Some(Commands::Tools { command }) => handle_tools(command).await,
-        Some(Commands::Run { prompt }) => {
-            run_prompt(
-                prompt,
-                cli.plan,
-                cli.accept_edits,
-                cli.sandbox,
-                cli.provider,
-                cli.model,
-            )
-            .await
-        }
+        Some(Commands::Run { prompt }) => run_prompt(prompt, prompt_options.clone()).await,
         Some(Commands::Ask { prompt }) => handle_ask(cli.provider, cli.model, prompt).await,
         Some(Commands::Providers { command }) => handle_providers(command),
         Some(Commands::Symbols { path, limit }) => handle_symbols(path, limit).await,
+        Some(Commands::References {
+            name,
+            path,
+            context_lines,
+            limit,
+        }) => handle_references(name, path, context_lines, limit).await,
+        Some(Commands::ModuleSummary { path, limit }) => handle_module_summary(path, limit).await,
         Some(Commands::Session { command }) => handle_session(command),
         Some(Commands::Memory { command }) => handle_memory(command),
         Some(Commands::Mcp { command }) => handle_mcp(command).await,
         Some(Commands::Restore { checkpoint_id }) => handle_restore(checkpoint_id),
-        None if !cli.prompt.is_empty() => {
-            run_prompt(
-                cli.prompt,
-                cli.plan,
-                cli.accept_edits,
-                cli.sandbox,
-                cli.provider,
-                cli.model,
-            )
-            .await
-        }
+        None if !cli.prompt.is_empty() => run_prompt(cli.prompt, prompt_options).await,
         None => {
             Cli::command().print_help()?;
             println!();
@@ -304,10 +341,54 @@ fn handle_config(command: ConfigCommand) -> Result<()> {
     }
 }
 
+fn command_policy_label(policy: CommandPolicy) -> &'static str {
+    match policy {
+        CommandPolicy::Allow => "allow",
+        CommandPolicy::Ask => "ask",
+        CommandPolicy::Deny => "deny",
+    }
+}
+
+fn command_executor_from_cli(
+    sandbox: bool,
+    executor: SandboxExecutorArg,
+    image: String,
+) -> Result<CommandExecutor> {
+    if !sandbox && executor != SandboxExecutorArg::Local {
+        anyhow::bail!("--sandbox-executor requires --sandbox");
+    }
+
+    match executor {
+        SandboxExecutorArg::Local => Ok(CommandExecutor::Local),
+        SandboxExecutorArg::Docker => Ok(CommandExecutor::Docker {
+            image,
+            network_disabled: true,
+        }),
+    }
+}
+
+fn print_command_executor(executor: &CommandExecutor) {
+    if let CommandExecutor::Docker {
+        image,
+        network_disabled,
+    } = executor
+    {
+        let network = if *network_disabled {
+            "disabled"
+        } else {
+            "enabled"
+        };
+        println!("sandbox_executor: docker");
+        println!("sandbox_image: {image}");
+        println!("sandbox_network: {network}");
+    }
+}
+
 async fn handle_tools(command: ToolsCommand) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let loaded = load_config(&cwd)?;
-    let registry = full_registry();
+    let mut registry = full_registry();
+    register_cli_mcp_tools(&mut registry, &cwd).await?;
 
     match command {
         ToolsCommand::List => {
@@ -337,14 +418,7 @@ async fn handle_tools(command: ToolsCommand) -> Result<()> {
     }
 }
 
-async fn run_prompt(
-    prompt: Vec<String>,
-    plan: bool,
-    accept_edits: bool,
-    sandbox: bool,
-    provider_override: Option<String>,
-    model_override: Option<String>,
-) -> Result<()> {
+async fn run_prompt(prompt: Vec<String>, options: PromptOptions) -> Result<()> {
     let prompt = prompt.join(" ");
     if prompt.trim().is_empty() {
         anyhow::bail!("prompt cannot be empty");
@@ -354,24 +428,35 @@ async fn run_prompt(
     let loaded = load_config(&cwd)?;
     let resolved = resolve_provider_config(
         &loaded.config,
-        provider_override.as_deref(),
-        model_override.as_deref(),
+        options.provider_override.as_deref(),
+        options.model_override.as_deref(),
     )?;
     let provider = build_agent_provider(&resolved)?;
     let project = ProjectInfo::discover(&cwd)?;
     let session = SessionInfo::new(&project);
     let session_path = create_session_jsonl(&session, &prompt)?;
 
-    let permission = resolve_permission(plan, accept_edits, sandbox, loaded.config.permission.mode);
-    let registry = if permission.edit_approval == EditApproval::Refuse
+    let permission = resolve_permission(
+        options.plan,
+        options.accept_edits,
+        options.sandbox,
+        loaded.config.permission.mode,
+    );
+    let mut registry = if permission.edit_approval == EditApproval::Refuse
         && permission.command_approval == CommandApproval::Refuse
     {
         readonly_registry()
     } else {
         full_registry()
     };
+    if permission.edit_approval != EditApproval::Refuse
+        || permission.command_approval != CommandApproval::Refuse
+    {
+        register_cli_mcp_tools(&mut registry, &cwd).await?;
+    }
 
     println!("mode: {}", permission.mode_label);
+    print_command_executor(&options.command_executor);
     println!("session: {}", session.id);
     println!("session_path: {}", session_path.display());
     println!("project_hash: {}", project.hash);
@@ -384,6 +469,7 @@ async fn run_prompt(
         permission.edit_approval,
         permission.command_approval,
         command_policy_from_config(&loaded.config),
+        options.command_executor,
         &session,
     );
     let result = run_agent(
@@ -397,6 +483,7 @@ async fn run_prompt(
             max_steps: 8,
             stream: loaded.config.ui.stream,
             resume_summary: None,
+            verification: verification_from_config(&loaded.config),
         },
     )
     .await?;
@@ -424,19 +511,15 @@ async fn run_prompt(
 async fn run_resumed_prompt(
     prompt: Vec<String>,
     requested_session_id: &str,
-    plan: bool,
-    accept_edits: bool,
-    sandbox: bool,
-    provider_override: Option<String>,
-    model_override: Option<String>,
+    options: PromptOptions,
 ) -> Result<()> {
     let prompt = prompt.join(" ");
     let cwd = env::current_dir().context("failed to read current directory")?;
     let loaded = load_config(&cwd)?;
     let resolved = resolve_provider_config(
         &loaded.config,
-        provider_override.as_deref(),
-        model_override.as_deref(),
+        options.provider_override.as_deref(),
+        options.model_override.as_deref(),
     )?;
     let project = ProjectInfo::discover(&cwd)?;
     let session_id = resolve_session_id(&project.hash, requested_session_id)?;
@@ -458,16 +541,27 @@ async fn run_resumed_prompt(
     let session = existing_session(&project, session_id);
     append_session_message(&session, "user", &prompt)?;
 
-    let permission = resolve_permission(plan, accept_edits, sandbox, loaded.config.permission.mode);
-    let registry = if permission.edit_approval == EditApproval::Refuse
+    let permission = resolve_permission(
+        options.plan,
+        options.accept_edits,
+        options.sandbox,
+        loaded.config.permission.mode,
+    );
+    let mut registry = if permission.edit_approval == EditApproval::Refuse
         && permission.command_approval == CommandApproval::Refuse
     {
         readonly_registry()
     } else {
         full_registry()
     };
+    if permission.edit_approval != EditApproval::Refuse
+        || permission.command_approval != CommandApproval::Refuse
+    {
+        register_cli_mcp_tools(&mut registry, &cwd).await?;
+    }
 
     println!("mode: {}", permission.mode_label);
+    print_command_executor(&options.command_executor);
     println!("session: {}", session.id);
     println!("session_path: {}", session_path.display());
     println!("project_hash: {}", project.hash);
@@ -481,6 +575,7 @@ async fn run_resumed_prompt(
         permission.edit_approval,
         permission.command_approval,
         command_policy_from_config(&loaded.config),
+        options.command_executor,
         &session,
     );
     let result = run_agent(
@@ -494,6 +589,7 @@ async fn run_resumed_prompt(
             max_steps: 8,
             stream: loaded.config.ui.stream,
             resume_summary: Some(summary),
+            verification: verification_from_config(&loaded.config),
         },
     )
     .await?;
@@ -593,12 +689,14 @@ fn build_tool_context(
     edit_approval: EditApproval,
     command_approval: CommandApproval,
     command_policy: CommandPolicyConfig,
+    command_executor: CommandExecutor,
     session: &SessionInfo,
 ) -> ToolContext {
     let mut ctx = ToolContext::new(cwd, max_file_size)
         .with_edit_approval(edit_approval)
         .with_command_approval(command_approval)
-        .with_command_policy(command_policy);
+        .with_command_policy(command_policy)
+        .with_command_executor(command_executor);
     if edit_approval != EditApproval::Refuse {
         let session_for_checkpoint = session.clone();
         let create_checkpoint: CreateCheckpoint = Arc::new(move |files: &[PathBuf]| {
@@ -630,6 +728,27 @@ fn command_policy_from_config(config: &AppConfig) -> CommandPolicyConfig {
         .as_ref()
         .map(|commands| commands.policy.clone())
         .unwrap_or_default()
+}
+
+fn verification_from_config(config: &AppConfig) -> Option<VerificationOptions> {
+    let command = config.commands.as_ref()?.test.as_deref()?.trim();
+    (!command.is_empty()).then(|| VerificationOptions::new(command))
+}
+
+async fn register_cli_mcp_tools(
+    registry: &mut luckcode_tools::ToolRegistry,
+    cwd: &PathBuf,
+) -> Result<()> {
+    let loaded = load_mcp_config(cwd)?;
+    if loaded.config.servers.is_empty() {
+        return Ok(());
+    }
+
+    let report = register_mcp_tools(registry, &loaded.config, 30).await;
+    for error in report.errors {
+        eprintln!("warning: failed to register MCP tools: {error}");
+    }
+    Ok(())
 }
 
 /// Print an edit preview and ask the user whether to apply it.
@@ -853,6 +972,59 @@ async fn handle_symbols(path: String, limit: usize) -> Result<()> {
     Ok(())
 }
 
+async fn handle_references(
+    name: String,
+    path: String,
+    context_lines: usize,
+    limit: usize,
+) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let loaded = load_config(&cwd)?;
+    let output = readonly_registry()
+        .execute(
+            ToolCall {
+                name: "find_references".to_string(),
+                arguments: serde_json::json!({
+                    "name": name,
+                    "path": path,
+                    "context_lines": context_lines,
+                    "limit": limit,
+                }),
+            },
+            ToolContext::new(cwd, loaded.config.workspace.max_file_size),
+        )
+        .await?;
+
+    println!("{}", output.content);
+    if output.truncated {
+        println!("\n[truncated]");
+    }
+    Ok(())
+}
+
+async fn handle_module_summary(path: String, limit: usize) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let loaded = load_config(&cwd)?;
+    let output = readonly_registry()
+        .execute(
+            ToolCall {
+                name: "module_summary".to_string(),
+                arguments: serde_json::json!({
+                    "path": path,
+                    "limit": limit,
+                }),
+            },
+            ToolContext::new(cwd, loaded.config.workspace.max_file_size),
+        )
+        .await?;
+
+    println!("{}", output.content);
+    if output.truncated {
+        println!("\n[truncated]");
+    }
+    Ok(())
+}
+
 fn print_providers(config: &AppConfig) {
     let active = resolve_provider_config(config, None, None)
         .map(|provider| provider.name)
@@ -1019,7 +1191,7 @@ async fn handle_mcp(command: McpCommand) -> Result<()> {
                 println!("No MCP servers configured.");
                 return Ok(());
             }
-            println!("NAME\tTRANSPORT\tSTATUS\tENV_KEYS");
+            println!("NAME\tTRANSPORT\tSTATUS\tENV_KEYS\tHEADER_KEYS");
             for (name, server) in loaded.config.servers {
                 let transport = if server.url.is_some() {
                     "http"
@@ -1032,7 +1204,8 @@ async fn handle_mcp(command: McpCommand) -> Result<()> {
                     "enabled"
                 };
                 let env_keys = server.env.keys().cloned().collect::<Vec<_>>().join(",");
-                println!("{name}\t{transport}\t{status}\t{env_keys}");
+                let header_keys = server.headers.keys().cloned().collect::<Vec<_>>().join(",");
+                println!("{name}\t{transport}\t{status}\t{env_keys}\t{header_keys}");
             }
             Ok(())
         }
@@ -1057,6 +1230,18 @@ async fn handle_mcp(command: McpCommand) -> Result<()> {
                     println!("- {key}=<redacted>");
                 }
             }
+            if !server.headers.is_empty() {
+                println!("headers:");
+                for key in server.headers.keys() {
+                    println!("- {key}=<redacted>");
+                }
+            }
+            if !server.tool_policies.is_empty() {
+                println!("tool_policies:");
+                for (tool, policy) in &server.tool_policies {
+                    println!("- {tool}={}", command_policy_label(*policy));
+                }
+            }
             Ok(())
         }
         McpCommand::Tools {
@@ -1079,6 +1264,30 @@ async fn handle_mcp(command: McpCommand) -> Result<()> {
             }
             Ok(())
         }
+        McpCommand::Resources {
+            server,
+            timeout_seconds,
+        } => {
+            let server_config = loaded
+                .config
+                .servers
+                .get(&server)
+                .with_context(|| format!("MCP server '{server}' is not configured"))?;
+            let result = list_mcp_resources(server_config, timeout_seconds).await?;
+            print_pretty_json(&result)
+        }
+        McpCommand::Prompts {
+            server,
+            timeout_seconds,
+        } => {
+            let server_config = loaded
+                .config
+                .servers
+                .get(&server)
+                .with_context(|| format!("MCP server '{server}' is not configured"))?;
+            let result = list_mcp_prompts(server_config, timeout_seconds).await?;
+            print_pretty_json(&result)
+        }
         McpCommand::Call {
             server,
             tool,
@@ -1093,14 +1302,17 @@ async fn handle_mcp(command: McpCommand) -> Result<()> {
             let arguments =
                 serde_json::from_str(&input).context("MCP tool input must be valid JSON")?;
             let result = call_mcp_tool(server_config, &tool, arguments, timeout_seconds).await?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result)
-                    .context("failed to serialize MCP tool result")?
-            );
-            Ok(())
+            print_pretty_json(&result)
         }
     }
+}
+
+fn print_pretty_json(value: &serde_json::Value) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).context("failed to serialize JSON output")?
+    );
+    Ok(())
 }
 
 fn handle_compact(requested_session_id: Option<&str>) -> Result<()> {
