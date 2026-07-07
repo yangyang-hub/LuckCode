@@ -13,10 +13,10 @@ use luckcode_model::{
     is_anthropic_provider, is_openai_compatible_provider,
 };
 use luckcode_storage::{
-    ProjectInfo, SessionInfo, append_session_checkpoint, append_session_message, create_checkpoint,
-    create_session_jsonl, latest_checkpoint, read_project_memory, read_session_events,
-    remove_project_memory, restore_checkpoint, session_exists, session_jsonl_path, sessions_root,
-    set_project_memory,
+    ProjectInfo, SessionInfo, append_session_checkpoint, append_session_message, config_dir,
+    create_checkpoint, create_session_jsonl, data_dir, latest_checkpoint, read_project_memory,
+    read_session_events, remove_project_memory, restore_checkpoint, session_exists,
+    session_jsonl_path, sessions_root, set_project_memory,
 };
 use luckcode_tools::{
     AnnounceCommand, CommandApproval, CommandExecutor, CommandPolicy, CommandPolicyConfig,
@@ -31,6 +31,9 @@ use std::{
     sync::Arc,
 };
 use tracing::Level;
+
+mod eval_runner;
+mod tui;
 
 #[derive(Debug, Parser)]
 #[command(name = "luckcode")]
@@ -139,6 +142,12 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommand,
     },
+    Eval {
+        #[command(subcommand)]
+        command: eval_runner::EvalCommand,
+    },
+    Doctor,
+    Tui,
     Restore {
         #[arg(value_name = "CHECKPOINT_ID")]
         checkpoint_id: Option<String>,
@@ -282,6 +291,9 @@ async fn run() -> Result<()> {
         Some(Commands::Session { command }) => handle_session(command),
         Some(Commands::Memory { command }) => handle_memory(command),
         Some(Commands::Mcp { command }) => handle_mcp(command).await,
+        Some(Commands::Eval { command }) => eval_runner::handle_eval(command).await,
+        Some(Commands::Doctor) => handle_doctor(),
+        Some(Commands::Tui) => tui::run_tui(),
         Some(Commands::Restore { checkpoint_id }) => handle_restore(checkpoint_id),
         None if !cli.prompt.is_empty() => run_prompt(cli.prompt, prompt_options).await,
         None => {
@@ -339,6 +351,115 @@ fn handle_config(command: ConfigCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn handle_doctor() -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let mut has_error = false;
+
+    print_check("workspace", cwd.display().to_string(), CheckStatus::Ok);
+
+    match config_dir() {
+        Ok(path) => print_check("config_dir", path.display().to_string(), CheckStatus::Ok),
+        Err(error) => {
+            has_error = true;
+            print_check("config_dir", format!("{error:#}"), CheckStatus::Error);
+        }
+    }
+
+    match data_dir() {
+        Ok(path) => {
+            if let Err(error) = fs::create_dir_all(&path) {
+                has_error = true;
+                print_check("data_dir", format!("{error:#}"), CheckStatus::Error);
+            } else {
+                print_check("data_dir", path.display().to_string(), CheckStatus::Ok);
+            }
+        }
+        Err(error) => {
+            has_error = true;
+            print_check("data_dir", format!("{error:#}"), CheckStatus::Error);
+        }
+    }
+
+    match load_config(&cwd) {
+        Ok(loaded) => {
+            print_check(
+                "config",
+                format!("{} source(s)", loaded.sources.len()),
+                CheckStatus::Ok,
+            );
+            match resolve_provider_config(&loaded.config, None, None) {
+                Ok(provider) => print_check(
+                    "provider",
+                    format!("{}/{}", provider.name, provider.model),
+                    CheckStatus::Ok,
+                ),
+                Err(error) => {
+                    has_error = true;
+                    print_check("provider", format!("{error:#}"), CheckStatus::Error);
+                }
+            }
+        }
+        Err(error) => {
+            has_error = true;
+            print_check("config", format!("{error:#}"), CheckStatus::Error);
+        }
+    }
+
+    match load_mcp_config(&cwd) {
+        Ok(loaded) => {
+            let status = if loaded.loaded { "loaded" } else { "missing" };
+            print_check(
+                "mcp_config",
+                format!("{status}: {}", loaded.path.display()),
+                CheckStatus::Ok,
+            );
+        }
+        Err(error) => {
+            has_error = true;
+            print_check("mcp_config", format!("{error:#}"), CheckStatus::Error);
+        }
+    }
+
+    let docker = Command::new("docker").arg("--version").output();
+    match docker {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            print_check("docker", version, CheckStatus::Ok);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            print_check("docker", stderr, CheckStatus::Warn);
+        }
+        Err(error) => print_check("docker", format!("{error}"), CheckStatus::Warn),
+    }
+
+    if has_error {
+        anyhow::bail!("doctor found blocking issues");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckStatus {
+    Ok,
+    Warn,
+    Error,
+}
+
+impl CheckStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+fn print_check(name: &str, detail: String, status: CheckStatus) {
+    println!("{}\t{}\t{}", status.label(), name, detail);
 }
 
 fn command_policy_label(policy: CommandPolicy) -> &'static str {

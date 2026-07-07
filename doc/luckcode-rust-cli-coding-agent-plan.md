@@ -1231,14 +1231,28 @@ luckcode "解释这个函数的调用链"
 
 ### v0.8：TUI
 
-> 状态：命令行 session browser baseline 已实现。`luckcode session list/show` 可查看 session 和事件 timeline；ratatui 交互式界面仍需后续实现。
+> 状态：ratatui baseline 已实现。`luckcode session list/show` 可查看 session 和事件 timeline；`luckcode tui` 提供三栏 session browser（session list / timeline / event detail）。interactive diff 和 TUI 内 checkpoint restore 仍需后续实现。
+> 下一阶段详细实现设计见 `luckcode-next-phase-implementation-design.md`。
 
 能力：
 
-- `ratatui`（后续）
+- `ratatui`（session browser baseline 已实现）
 - interactive diff（后续）
-- tool call timeline（命令行 baseline 已实现）
-- session browser（命令行 baseline 已实现）
+- tool call timeline（命令行 + TUI baseline 已实现）
+- session browser（命令行 + TUI baseline 已实现）
+
+### v0.9：Eval / Release baseline
+
+> 状态：eval / doctor baseline 已实现。`luckcode eval list` 可发现 `evals/*/eval.toml` fixture，`luckcode eval run [NAME] --json` 会复制 fixture input 到临时 workspace、执行安全测试命令、输出 human / JSON report，并在执行前复用危险命令拦截。`luckcode doctor` 可检查 workspace、配置目录、数据目录、provider、MCP 配置和 Docker 可用性。Release 打包流程仍需后续实现。
+
+能力：
+
+- eval fixture discovery（已实现）
+- eval isolated workspace copy（已实现）
+- eval test command execution（已实现）
+- eval JSON report（已实现）
+- `luckcode doctor`（已实现）
+- release build checklist（后续）
 
 ### v1.0：稳定版
 

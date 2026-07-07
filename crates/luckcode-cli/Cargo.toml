@@ -12,9 +12,13 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 futures-util.workspace = true
+ratatui.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -22,3 +26,6 @@ luckcode-core.workspace = true
 luckcode-model.workspace = true
 luckcode-storage.workspace = true
 luckcode-tools.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

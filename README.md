@@ -1,6 +1,6 @@
 # LuckCode
 
-LuckCode 是一个用 Rust 编写的本地 CLI Coding Agent。项目当前处于早期实现阶段：已经完成 workspace 骨架、CLI 入口、项目初始化、配置加载、只读本地工具、基础 session JSONL、第一版 Agent Loop、带 diff 预览/用户确认/checkpoint 的文件编辑系统（`edit_file` / `write_file` + `restore`）、编辑后的配置化自动测试、带命令权限策略/确认/超时/输出截断的 `run_shell`、第一版 resume / compact / project memory、tree-sitter-backed symbol index / function-level context、更完整的 system context、HTTP provider 超时/重试/错误展示，以及 stdio / HTTP MCP tool/resource/prompt discovery、tool call、细粒度 tool policy 和 Agent registry 集成。
+LuckCode 是一个用 Rust 编写的本地 CLI Coding Agent。项目当前处于早期实现阶段：已经完成 workspace 骨架、CLI 入口、项目初始化、配置加载、只读本地工具、基础 session JSONL、第一版 Agent Loop、带 diff 预览/用户确认/checkpoint 的文件编辑系统（`edit_file` / `write_file` + `restore`）、编辑后的配置化自动测试、带命令权限策略/确认/超时/输出截断的 `run_shell`、第一版 resume / compact / project memory、tree-sitter-backed symbol index / function-level context、更完整的 system context、HTTP provider 超时/重试/错误展示、stdio / HTTP MCP tool/resource/prompt discovery、tool call、细粒度 tool policy 和 Agent registry 集成，以及 ratatui session browser 和 eval runner baseline。
 
 目标不是做玩具 Demo，而是逐步实现一个类似 Claude Code / Codex 的本地编程 Agent：
 
@@ -53,6 +53,9 @@ luckcode --compact
 - 非 `--plan` Agent 模式会把 MCP tools 注册为 `mcp_<server>_<tool>` 本地工具，并走与 shell 相同的确认 / allowlist / denylist 策略；`.luckcode/mcp.json` 可用 `tool_policies` 为单个 tool 配置 `allow` / `ask` / `deny`。
 - session JSONL 会记录 user、assistant、tool_call、tool_result、checkpoint 和 compact_summary。
 - `luckcode session list` / `session show` 可以浏览已有 session 和事件 timeline。
+- `luckcode tui`：打开 ratatui session browser，浏览 session、timeline 和事件详情。
+- `luckcode eval list` / `eval run`：发现并运行本地 eval fixture，支持 JSON report，并在执行测试命令前做危险命令拦截。
+- `luckcode doctor`：检查 workspace、配置目录、数据目录、provider、MCP 配置和 Docker 可用性。
 
 ## 常用命令
 
@@ -90,6 +93,7 @@ cargo run -p luckcode-cli -- --sandbox --sandbox-executor docker --sandbox-image
 cargo run -p luckcode-cli -- restore
 cargo run -p luckcode-cli -- session list
 cargo run -p luckcode-cli -- session show
+cargo run -p luckcode-cli -- tui
 cargo run -p luckcode-cli -- --compact
 cargo run -p luckcode-cli -- --resume
 cargo run -p luckcode-cli -- --resume ses_xxx "继续完成下一步"
@@ -101,6 +105,9 @@ cargo run -p luckcode-cli -- mcp tools local
 cargo run -p luckcode-cli -- mcp resources local
 cargo run -p luckcode-cli -- mcp prompts local
 cargo run -p luckcode-cli -- mcp call local lookup '{"key":"value"}'
+cargo run -p luckcode-cli -- eval list
+cargo run -p luckcode-cli -- eval run shell_safety --json
+cargo run -p luckcode-cli -- doctor
 ```
 
 `ask --provider mock`、`ask --provider openai`、`ask --provider responses` 和 `ask --provider anthropic` 都会走 `ModelProvider` 流式输出；普通 prompt 会走 Agent Loop。`--plan` 只挂只读工具；`--sandbox` 禁止编辑但允许经确认的 shell；其它模式下工具集包含 `edit_file` / `write_file` / `run_shell`，写文件前会展示 diff、按权限模式询问确认并创建 checkpoint，shell 命令会经过 `CommandPolicy` / `PermissionEngine` 检查。Agent Loop 会在 system context 中注入 `AGENTS.md`、项目类型、关键 manifest / README 预览、Git status、diff stat 和 project memory；`--resume` 会额外注入上一轮 compact summary。
@@ -314,6 +321,8 @@ AGENTS.md
 
 ## 下一阶段
 
-1. 接入 ratatui TUI，提供交互式 diff、tool call timeline 和 session browser。
-2. 完善 Docker sandbox 的镜像选择、缓存挂载和跨平台路径处理。
-3. 增加 eval runner 和 release 打包流程。
+详细设计见 `doc/luckcode-next-phase-implementation-design.md`。
+
+1. 完善 Docker sandbox 的 copy workspace、镜像选择、缓存挂载和跨平台路径处理。
+2. 扩展 eval runner：更多 fixtures、Agent 驱动模式、CI report 归档。
+3. 完善 release 打包、安装文档和 MCP HTTP/SSE 强化。
